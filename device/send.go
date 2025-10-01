@@ -6,8 +6,10 @@
 package device
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"math/big"
 	"net"
 	"os"
 	"sync"
@@ -27,29 +29,14 @@ import (
  * 3. Nonce assignment (sequential)
  * 4. Encryption (parallel)
  * 5. Transmission (sequential)
- *
- * The functions in this file occur (roughly) in the order in
- * which the packets are processed.
- *
- * Locking, Producers and Consumers
- *
- * The order of packets (per peer) must be maintained,
- * but encryption of packets happen out-of-order:
- *
- * The sequential consumers will attempt to take the lock,
- * workers release lock when they have completed work (encryption) on the packet.
- *
- * If the element is inserted into the "encryption queue",
- * the content is preceded by enough "junk" to contain the transport header
- * (to allow the construction of transport messages in-place)
  */
 
 type QueueOutboundElement struct {
-	buffer  *[MaxMessageSize]byte // slice holding the packet data
-	packet  []byte                // slice of "buffer" (always!)
-	nonce   uint64                // nonce for encryption
-	keypair *Keypair              // keypair for encryption
-	peer    *Peer                 // related peer
+	buffer  *[MaxMessageSize]byte
+	packet  []byte
+	nonce   uint64
+	keypair *Keypair
+	peer    *Peer
 }
 
 type QueueOutboundElementsContainer struct {
@@ -61,14 +48,9 @@ func (device *Device) NewOutboundElement() *QueueOutboundElement {
 	elem := device.GetOutboundElement()
 	elem.buffer = device.GetMessageBuffer()
 	elem.nonce = 0
-	// keypair and peer were cleared (if necessary) by clearPointers.
 	return elem
 }
 
-// clearPointers clears elem fields that contain pointers.
-// This makes the garbage collector's life easier and
-// avoids accidentally keeping other objects around unnecessarily.
-// It also reduces the possible collateral damage from use-after-free bugs.
 func (elem *QueueOutboundElement) clearPointers() {
 	elem.buffer = nil
 	elem.packet = nil
@@ -76,10 +58,184 @@ func (elem *QueueOutboundElement) clearPointers() {
 	elem.peer = nil
 }
 
-/* Queues a keepalive if no packets are queued for peer
- */
+/* --------------------------------------------------------------------
+   Compatibility-safe, automatic obfuscation + MSS clamp
+
+   • Before EVERY handshake initiation (including retries):
+       - send 1 tiny random UDP datagram (24–48 bytes), no sleeps
+
+   • Automatic TCP MSS clamping on IPv4 SYN packets from TUN:
+       - MSS ≤ (TUN MTU − 40), with floor 536
+       - Recompute TCP checksum (IP header unchanged)
+---------------------------------------------------------------------*/
+
+const (
+	coverSizeMin = 24
+	coverSizeMax = 48
+)
+
+func crandInt(min, max int) (int, error) {
+	if max <= min {
+		return min, nil
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(max-min+1)))
+	if err != nil {
+		return 0, err
+	}
+	return min + int(n.Int64()), nil
+}
+
+func crandBytes(n int) ([]byte, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+	b := make([]byte, n)
+	_, err := rand.Read(b)
+	return b, err
+}
+
+// best-effort single tiny UDP before real initiation
+func (peer *Peer) sendSingleCover() {
+	sz, err := crandInt(coverSizeMin, coverSizeMax)
+	if err != nil {
+		peer.device.log.Verbosef("%v - cover size rng error: %v", peer, err)
+		return
+	}
+	b, err := crandBytes(sz)
+	if err != nil || len(b) == 0 {
+		if err != nil {
+			peer.device.log.Verbosef("%v - cover fill error: %v", peer, err)
+		}
+		return
+	}
+	_ = peer.SendBuffers([][]byte{b}) // best effort
+}
+
+/*************** TCP MSS clamp (IPv4) ***************/
+
+func onesSum(b []byte) uint32 {
+	var s uint32
+	for len(b) >= 2 {
+		s += uint32(binary.BigEndian.Uint16(b[:2]))
+		b = b[2:]
+	}
+	if len(b) == 1 {
+		s += uint32(uint16(b[0]) << 8)
+	}
+	return s
+}
+
+func csumFinalize(s uint32) uint16 {
+	for (s >> 16) != 0 {
+		s = (s & 0xFFFF) + (s >> 16)
+	}
+	return ^uint16(s)
+}
+
+// clampTCPSYNMSSv4 clamps MSS option on IPv4 TCP SYN; returns true if changed.
+func clampTCPSYNMSSv4(pkt []byte, tunMTU int) (changed bool) {
+	if len(pkt) < ipv4.HeaderLen {
+		return false
+	}
+	ihl := int((pkt[0] & 0x0F) << 2)
+	if ihl < ipv4.HeaderLen || len(pkt) < ihl+20 {
+		return false
+	}
+	if pkt[9] != 6 { // TCP
+		return false
+	}
+	totalLen := int(binary.BigEndian.Uint16(pkt[2:4]))
+	if totalLen == 0 || totalLen > len(pkt) {
+		totalLen = len(pkt)
+	}
+	ipHdr := pkt[:ihl]
+	tcp := pkt[ihl:totalLen]
+	if len(tcp) < 20 {
+		return false
+	}
+	doff := int((tcp[12] >> 4) * 4)
+	if doff < 20 || len(tcp) < doff {
+		return false
+	}
+	flags := tcp[13]
+	const tcpFlagSYN = 0x02
+	if (flags & tcpFlagSYN) == 0 {
+		return false
+	}
+
+	// Calculate clamp target for IPv4: MTU - (20 IP + 20 TCP)
+	targetMSS := tunMTU - 40
+	if targetMSS < 536 {
+		targetMSS = 536
+	}
+
+	// Parse TCP options, find MSS (kind=2,len=4)
+	opts := tcp[20:doff]
+	i := 0
+	var curMSS *uint16
+	for i < len(opts) {
+		kind := opts[i]
+		if kind == 0 { // End
+			break
+		}
+		if kind == 1 { // NOP
+			i++
+			continue
+		}
+		if i+1 >= len(opts) {
+			break
+		}
+		olen := int(opts[i+1])
+		if olen < 2 || i+olen > len(opts) {
+			break
+		}
+		if kind == 2 && olen == 4 {
+			// MSS value
+			cur := binary.BigEndian.Uint16(opts[i+2 : i+4])
+			if int(cur) > targetMSS {
+				// write new MSS
+				binary.BigEndian.PutUint16(opts[i+2:i+4], uint16(targetMSS))
+				curMSS = &cur
+			}
+			break
+		}
+		i += olen
+	}
+	if curMSS == nil {
+		return false
+	}
+
+	// Recompute TCP checksum (IPv4 pseudo header)
+	// Pseudo: src(4) dst(4) zero(1) proto(1) tcpLen(2)
+	src := ipHdr[12:16]
+	dst := ipHdr[16:20]
+	tcpLen := uint16(len(tcp))
+
+	// zero the checksum field
+	tcp[16] = 0
+	tcp[17] = 0
+
+	var sum uint32
+	pseudo := make([]byte, 12)
+	copy(pseudo[0:4], src)
+	copy(pseudo[4:8], dst)
+	pseudo[8] = 0
+	pseudo[9] = 6 // TCP
+	binary.BigEndian.PutUint16(pseudo[10:12], tcpLen)
+	sum += onesSum(pseudo)
+	sum += onesSum(tcp)
+
+	csum := csumFinalize(sum)
+	binary.BigEndian.PutUint16(tcp[16:18], csum)
+
+	return true
+}
+
+/******************** Standard WG paths ********************/
+
 func (peer *Peer) SendKeepalive() {
 	if len(peer.queue.staged) == 0 && peer.isRunning.Load() {
+		// No cover here; keepalives must be minimal and timely.
 		elem := peer.device.NewOutboundElement()
 		elemsContainer := peer.device.GetOutboundElementsContainer()
 		elemsContainer.elems = append(elemsContainer.elems, elem)
@@ -116,6 +272,9 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	peer.handshake.mutex.Unlock()
 
 	peer.device.log.Verbosef("%v - Sending handshake initiation", peer)
+
+	// Tiny cover datagram, best-effort, no sleeps
+	peer.sendSingleCover()
 
 	msg, err := peer.device.CreateMessageInitiation(peer)
 	if err != nil {
@@ -166,7 +325,6 @@ func (peer *Peer) SendHandshakeResponse() error {
 	peer.timersAnyAuthenticatedPacketTraversal()
 	peer.timersAnyAuthenticatedPacketSent()
 
-	// TODO: allocation could be avoided
 	err = peer.SendBuffers([][]byte{packet})
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to send handshake response: %v", peer, err)
@@ -186,7 +344,6 @@ func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement)
 
 	packet := make([]byte, MessageCookieReplySize)
 	_ = reply.marshal(packet)
-	// TODO: allocation could be avoided
 	device.net.bind.Send([][]byte{packet}, initiatingElem.endpoint)
 
 	return nil
@@ -248,6 +405,9 @@ func (device *Device) RoutineReadFromTUN() {
 			elem := elems[i]
 			elem.packet = bufs[i][offset : offset+sizes[i]]
 
+			// ---- Automatic MSS clamp on IPv4 TCP SYN
+			_ = clampTCPSYNMSSv4(elem.packet, int(device.tun.mtu.Load()))
+
 			// lookup peer
 			var peer *Peer
 			switch elem.packet[0] >> 4 {
@@ -298,9 +458,6 @@ func (device *Device) RoutineReadFromTUN() {
 
 		if readErr != nil {
 			if errors.Is(readErr, tun.ErrTooManySegments) {
-				// TODO: record stat for this
-				// This will happen if MSS is surprisingly small (< 576)
-				// coincident with reasonably high throughput.
 				device.log.Verbosef("Dropped some packets from multi-segment read: %v", readErr)
 				continue
 			}
@@ -372,7 +529,7 @@ top:
 			elemsContainer.elems = elemsContainer.elems[:i]
 
 			if elemsContainerOOO != nil {
-				peer.StagePackets(elemsContainerOOO) // XXX: Out of order, but we can't front-load go chans
+				peer.StagePackets(elemsContainerOOO)
 			}
 
 			if len(elemsContainer.elems) == 0 {
@@ -380,7 +537,6 @@ top:
 				goto top
 			}
 
-			// add to parallel and sequential queue
 			if peer.isRunning.Load() {
 				peer.queue.outbound.c <- elemsContainer
 				peer.device.queue.encryption.c <- elemsContainer
@@ -431,11 +587,6 @@ func calculatePaddingSize(packetSize, mtu int) int {
 	return paddedSize - lastUnit
 }
 
-/* Encrypts the elements in the queue
- * and marks them for sequential consumption (by releasing the mutex)
- *
- * Obs. One instance per core
- */
 func (device *Device) RoutineEncryption(id int) {
 	var paddingZeros [PaddingMultiple]byte
 	var nonce [chacha20poly1305.NonceSize]byte
@@ -445,9 +596,7 @@ func (device *Device) RoutineEncryption(id int) {
 
 	for elemsContainer := range device.queue.encryption.c {
 		for _, elem := range elemsContainer.elems {
-			// populate header fields
 			header := elem.buffer[:MessageTransportHeaderSize]
-
 			fieldType := header[0:4]
 			fieldReceiver := header[4:8]
 			fieldNonce := header[8:16]
@@ -456,19 +605,11 @@ func (device *Device) RoutineEncryption(id int) {
 			binary.LittleEndian.PutUint32(fieldReceiver, elem.keypair.remoteIndex)
 			binary.LittleEndian.PutUint64(fieldNonce, elem.nonce)
 
-			// pad content to multiple of 16
 			paddingSize := calculatePaddingSize(len(elem.packet), int(device.tun.mtu.Load()))
 			elem.packet = append(elem.packet, paddingZeros[:paddingSize]...)
 
-			// encrypt content and release to consumer
-
 			binary.LittleEndian.PutUint64(nonce[4:], elem.nonce)
-			elem.packet = elem.keypair.send.Seal(
-				header,
-				nonce[:],
-				elem.packet,
-				nil,
-			)
+			elem.packet = elem.keypair.send.Seal(header, nonce[:], elem.packet, nil)
 		}
 		elemsContainer.Unlock()
 	}
@@ -490,12 +631,6 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 			return
 		}
 		if !peer.isRunning.Load() {
-			// peer has been stopped; return re-usable elems to the shared pool.
-			// This is an optimization only. It is possible for the peer to be stopped
-			// immediately after this check, in which case, elem will get processed.
-			// The timers and SendBuffers code are resilient to a few stragglers.
-			// TODO: rework peer shutdown order to ensure
-			// that we never accidentally keep timers alive longer than necessary.
 			elemsContainer.Lock()
 			for _, elem := range elemsContainer.elems {
 				device.PutMessageBuffer(elem.buffer)
