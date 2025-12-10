@@ -1,14 +1,10 @@
-/* SPDX-License-Identifier: MIT
- *
- * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
- */
-
 package device
 
 import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"math/big"
 	"net"
 	"os"
 	"sync"
@@ -21,15 +17,6 @@ import (
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/tun"
 )
-
-/* ZERO-LATENCY Enhanced Obfuscation:
- *
- * 1. ASYNC cover traffic (non-blocking goroutines)
- * 2. Pre-computed random padding cache (zero crypto delay)
- * 3. Parallel MSS clamping (doesn't block packet flow)
- * 4. Smart batching (reduces syscalls = lower latency)
- * 5. Optimized checksum (SIMD-friendly)
- */
 
 type QueueOutboundElement struct {
 	buffer  *[MaxMessageSize]byte
@@ -44,210 +31,229 @@ type QueueOutboundElementsContainer struct {
 	elems []*QueueOutboundElement
 }
 
-/* ═══════════════════════════════════════════════════════════
-   ZERO-LATENCY OBFUSCATION LAYER
-   ═══════════════════════════════════════════════════════════ */
-
 const (
-	// Cover traffic (async, non-blocking)
-	coverSizeMin = 40
-	coverSizeMax = 80
-
-	// Pre-computed padding cache
-	paddingCacheSize = 256
-	paddingExtraMax  = 16 // Reduced from 32 for speed
+	coverSizeMin    = 24
+	coverSizeMax    = 48
+	jitterMin       = 4
+	jitterMax       = 20
+	jitterCacheSize = 256
 )
 
-// Global pre-computed padding cache (initialized once at startup)
 var (
-	paddingCache      [paddingCacheSize][paddingExtraMax]byte
-	paddingCacheIdx   atomic.Uint32
-	paddingCacheReady atomic.Bool
+	jitterCache     [jitterCacheSize]byte
+	jitterCacheIdx  atomic.Uint32
+	jitterCacheInit atomic.Bool
 )
 
-// Initialize padding cache at startup (one-time cost)
-func initPaddingCache() {
-	if paddingCacheReady.Load() {
+func initJitterCache() {
+	if jitterCacheInit.Load() {
 		return
 	}
-	for i := 0; i < paddingCacheSize; i++ {
-		rand.Read(paddingCache[i][:])
-	}
-	paddingCacheReady.Store(true)
+	rand.Read(jitterCache[:])
+	jitterCacheInit.Store(true)
 }
 
-// Fast random int (uses pre-seeded state, no syscall)
+func secureRandInt(min, max int) (int, error) {
+	if max <= min {
+		return min, nil
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(max-min+1)))
+	if err != nil {
+		return min, err
+	}
+	return min + int(n.Int64()), nil
+}
+
+func secureRandBytes(n int) ([]byte, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+	b := make([]byte, n)
+	_, err := rand.Read(b)
+	return b, err
+}
+
 func fastRandInt(min, max int) int {
 	if max <= min {
 		return min
 	}
-	// Use atomic counter for lock-free pseudo-randomness
-	idx := paddingCacheIdx.Add(1)
-	val := int(paddingCache[idx%paddingCacheSize][0])
+	idx := jitterCacheIdx.Add(1) % jitterCacheSize
+	val := int(jitterCache[idx])
 	return min + (val % (max - min + 1))
 }
 
-// Get pre-computed random bytes (ZERO latency)
-func getCachedPadding(n int) []byte {
-	if n <= 0 || n > paddingExtraMax {
-		return nil
+func (peer *Peer) sendCoverPacket() {
+	sz, err := secureRandInt(coverSizeMin, coverSizeMax)
+	if err != nil {
+		return
 	}
-	idx := paddingCacheIdx.Add(1) % paddingCacheSize
-	return paddingCache[idx][:n]
+	b, err := secureRandBytes(sz)
+	if err != nil || len(b) == 0 {
+		return
+	}
+	_ = peer.SendBuffers([][]byte{b})
 }
 
-// ASYNC cover traffic (goroutine, non-blocking)
-func (peer *Peer) sendAsyncCover() {
-	go func() {
-		// Single packet, TLS-like pattern
-		sz := fastRandInt(coverSizeMin, coverSizeMax)
-		b := make([]byte, sz)
+func addJitterPadding(pkt []byte) []byte {
+	if !jitterCacheInit.Load() {
+		return pkt
+	}
 
-		// Fast pattern injection (no crypto needed)
-		b[0] = 0x16 // TLS Handshake
-		b[1] = 0x03
-		b[2] = 0x01 | byte(fastRandInt(0, 3)) // TLS 1.0-1.3
+	extra := fastRandInt(jitterMin, jitterMax)
+	if extra <= 0 || len(pkt)+extra > MaxMessageSize-chacha20poly1305.Overhead {
+		return pkt
+	}
 
-		// Fill rest with cached padding
-		if sz > 3 {
-			cached := getCachedPadding(min(sz-3, paddingExtraMax))
-			copy(b[3:], cached)
+	idx := jitterCacheIdx.Add(1) % jitterCacheSize
+	patternType := jitterCache[idx] & 0x03
+
+	padding := make([]byte, extra)
+	switch patternType {
+	case 0:
+		for i := range padding {
+			padding[i] = 0x00
 		}
+	case 1:
+		for i := range padding {
+			padding[i] = byte(i & 0xFF)
+		}
+	case 2:
+		fillIdx := jitterCacheIdx.Add(1) % jitterCacheSize
+		fillByte := jitterCache[fillIdx]
+		for i := range padding {
+			padding[i] = fillByte
+		}
+	case 3:
+		for i := 0; i < extra; i++ {
+			cacheIdx := (idx + uint32(i)) % jitterCacheSize
+			padding[i] = jitterCache[cacheIdx]
+		}
+	}
 
-		_ = peer.SendBuffers([][]byte{b}) // Fire and forget
-	}()
+	return append(pkt, padding...)
 }
 
-/* ═══════════════════════════════════════════════════════════
-   OPTIMIZED TCP MSS CLAMPING (IPv4 + IPv6)
-   ═══════════════════════════════════════════════════════════ */
-
-// Fast checksum computation (optimized for modern CPUs)
-func fastChecksum(data []byte) uint16 {
+func onesComplementSum(data []byte) uint32 {
 	var sum uint32
-
-	// Process 4 bytes at a time (better CPU utilization)
-	i := 0
-	for ; i+3 < len(data); i += 4 {
-		sum += uint32(data[i])<<8 | uint32(data[i+1])
-		sum += uint32(data[i+2])<<8 | uint32(data[i+3])
+	for len(data) >= 2 {
+		sum += uint32(binary.BigEndian.Uint16(data[:2]))
+		data = data[2:]
 	}
-
-	// Handle remaining bytes
-	for ; i+1 < len(data); i += 2 {
-		sum += uint32(data[i])<<8 | uint32(data[i+1])
+	if len(data) == 1 {
+		sum += uint32(uint16(data[0]) << 8)
 	}
-	if i < len(data) {
-		sum += uint32(data[i]) << 8
-	}
+	return sum
+}
 
-	// Fold to 16 bits
-	for sum > 0xFFFF {
+func finalizeChecksum(sum uint32) uint16 {
+	for (sum >> 16) != 0 {
 		sum = (sum & 0xFFFF) + (sum >> 16)
 	}
-
 	return ^uint16(sum)
 }
 
-// IPv4 TCP MSS clamping (optimized)
-func clampTCPSYNMSSv4(pkt []byte, tunMTU int) bool {
-	if len(pkt) < 40 { // Fast rejection
+func clampTCPMSSv4(pkt []byte, tunMTU int) bool {
+	if len(pkt) < ipv4.HeaderLen {
 		return false
 	}
 
-	// Quick protocol check
-	if pkt[9] != 6 { // Not TCP
+	ihl := int((pkt[0] & 0x0F) << 2)
+	if ihl < ipv4.HeaderLen || len(pkt) < ihl+20 {
 		return false
 	}
 
-	ihl := int(pkt[0]&0x0F) << 2
-	if ihl < 20 || len(pkt) < ihl+20 {
+	if pkt[9] != 6 {
 		return false
 	}
 
-	tcp := pkt[ihl:]
-	doff := int(tcp[12]>>4) << 2
-	if doff < 20 || len(tcp) < doff {
+	totalLen := int(binary.BigEndian.Uint16(pkt[2:4]))
+	if totalLen == 0 || totalLen > len(pkt) {
+		totalLen = len(pkt)
+	}
+
+	ipHdr := pkt[:ihl]
+	tcp := pkt[ihl:totalLen]
+
+	if len(tcp) < 20 {
 		return false
 	}
 
-	// Check SYN flag
-	if tcp[13]&0x02 == 0 {
+	dataOffset := int((tcp[12] >> 4) * 4)
+	if dataOffset < 20 || len(tcp) < dataOffset {
 		return false
 	}
 
-	// Target MSS
+	flags := tcp[13]
+	if (flags & 0x02) == 0 {
+		return false
+	}
+
 	targetMSS := tunMTU - 40
 	if targetMSS < 536 {
 		targetMSS = 536
 	}
 
-	// Find and clamp MSS option
-	opts := tcp[20:doff]
+	opts := tcp[20:dataOffset]
 	changed := false
-	for i := 0; i < len(opts); {
-		if opts[i] == 0 { // End
+	i := 0
+
+	for i < len(opts) {
+		kind := opts[i]
+		if kind == 0 {
 			break
 		}
-		if opts[i] == 1 { // NOP
+		if kind == 1 {
 			i++
 			continue
 		}
 		if i+1 >= len(opts) {
 			break
 		}
-		olen := int(opts[i+1])
-		if olen < 2 || i+olen > len(opts) {
+		optLen := int(opts[i+1])
+		if optLen < 2 || i+optLen > len(opts) {
 			break
 		}
-		if opts[i] == 2 && olen == 4 { // MSS option
-			cur := binary.BigEndian.Uint16(opts[i+2:])
-			if int(cur) > targetMSS {
-				binary.BigEndian.PutUint16(opts[i+2:], uint16(targetMSS))
+		if kind == 2 && optLen == 4 {
+			currentMSS := binary.BigEndian.Uint16(opts[i+2 : i+4])
+			if int(currentMSS) > targetMSS {
+				binary.BigEndian.PutUint16(opts[i+2:i+4], uint16(targetMSS))
 				changed = true
 			}
 			break
 		}
-		i += olen
+		i += optLen
 	}
 
 	if !changed {
 		return false
 	}
 
-	// Fast checksum recompute
-	tcp[16], tcp[17] = 0, 0
+	tcp[16] = 0
+	tcp[17] = 0
 
-	// Pseudo-header
+	srcIP := ipHdr[12:16]
+	dstIP := ipHdr[16:20]
+	tcpLen := uint16(len(tcp))
+
 	var sum uint32
-	sum += uint32(pkt[12])<<8 | uint32(pkt[13]) // src[0:2]
-	sum += uint32(pkt[14])<<8 | uint32(pkt[15]) // src[2:4]
-	sum += uint32(pkt[16])<<8 | uint32(pkt[17]) // dst[0:2]
-	sum += uint32(pkt[18])<<8 | uint32(pkt[19]) // dst[2:4]
-	sum += 6                                    // protocol
-	sum += uint32(len(tcp))                     // TCP length
+	pseudoHeader := make([]byte, 12)
+	copy(pseudoHeader[0:4], srcIP)
+	copy(pseudoHeader[4:8], dstIP)
+	pseudoHeader[8] = 0
+	pseudoHeader[9] = 6
+	binary.BigEndian.PutUint16(pseudoHeader[10:12], tcpLen)
 
-	// TCP segment
-	for i := 0; i+1 < len(tcp); i += 2 {
-		sum += uint32(tcp[i])<<8 | uint32(tcp[i+1])
-	}
-	if len(tcp)&1 != 0 {
-		sum += uint32(tcp[len(tcp)-1]) << 8
-	}
+	sum += onesComplementSum(pseudoHeader)
+	sum += onesComplementSum(tcp)
 
-	// Finalize
-	for sum > 0xFFFF {
-		sum = (sum & 0xFFFF) + (sum >> 16)
-	}
-	csum := ^uint16(sum)
+	checksum := finalizeChecksum(sum)
+	binary.BigEndian.PutUint16(tcp[16:18], checksum)
 
-	binary.BigEndian.PutUint16(tcp[16:], csum)
 	return true
 }
 
-// IPv6 TCP MSS clamping (optimized)
-func clampTCPSYNMSSv6(pkt []byte, tunMTU int) bool {
-	if len(pkt) < 60 || pkt[6] != 6 { // Fast rejection
+func clampTCPMSSv6(pkt []byte, tunMTU int) bool {
+	if len(pkt) < 60 || pkt[6] != 6 {
 		return false
 	}
 
@@ -256,8 +262,12 @@ func clampTCPSYNMSSv6(pkt []byte, tunMTU int) bool {
 		return false
 	}
 
-	doff := int(tcp[12]>>4) << 2
-	if doff < 20 || len(tcp) < doff || tcp[13]&0x02 == 0 {
+	dataOffset := int((tcp[12] >> 4) * 4)
+	if dataOffset < 20 || len(tcp) < dataOffset {
+		return false
+	}
+
+	if tcp[13]&0x02 == 0 {
 		return false
 	}
 
@@ -266,44 +276,45 @@ func clampTCPSYNMSSv6(pkt []byte, tunMTU int) bool {
 		targetMSS = 1220
 	}
 
-	// Find MSS
-	opts := tcp[20:doff]
+	opts := tcp[20:dataOffset]
 	changed := false
-	for i := 0; i < len(opts); {
-		if opts[i] == 0 {
+	i := 0
+
+	for i < len(opts) {
+		kind := opts[i]
+		if kind == 0 {
 			break
 		}
-		if opts[i] == 1 {
+		if kind == 1 {
 			i++
 			continue
 		}
 		if i+1 >= len(opts) {
 			break
 		}
-		olen := int(opts[i+1])
-		if olen < 2 || i+olen > len(opts) {
+		optLen := int(opts[i+1])
+		if optLen < 2 || i+optLen > len(opts) {
 			break
 		}
-		if opts[i] == 2 && olen == 4 {
-			cur := binary.BigEndian.Uint16(opts[i+2:])
-			if int(cur) > targetMSS {
-				binary.BigEndian.PutUint16(opts[i+2:], uint16(targetMSS))
+		if kind == 2 && optLen == 4 {
+			currentMSS := binary.BigEndian.Uint16(opts[i+2 : i+4])
+			if int(currentMSS) > targetMSS {
+				binary.BigEndian.PutUint16(opts[i+2:i+4], uint16(targetMSS))
 				changed = true
 			}
 			break
 		}
-		i += olen
+		i += optLen
 	}
 
 	if !changed {
 		return false
 	}
 
-	// Fast IPv6 checksum
-	tcp[16], tcp[17] = 0, 0
+	tcp[16] = 0
+	tcp[17] = 0
 
 	var sum uint32
-	// Pseudo-header: src(16) + dst(16) + len(4) + proto(4)
 	for i := 8; i < 40; i += 2 {
 		sum += uint32(pkt[i])<<8 | uint32(pkt[i+1])
 	}
@@ -338,10 +349,6 @@ func (elem *QueueOutboundElement) clearPointers() {
 	elem.keypair = nil
 	elem.peer = nil
 }
-
-/* ═══════════════════════════════════════════════════════════
-   STANDARD WIREGUARD PATHS (OPTIMIZED)
-   ═══════════════════════════════════════════════════════════ */
 
 func (peer *Peer) SendKeepalive() {
 	if len(peer.queue.staged) == 0 && peer.isRunning.Load() {
@@ -382,8 +389,7 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 
 	peer.device.log.Verbosef("%v - Sending handshake initiation", peer)
 
-	// ZERO-LATENCY: Async cover traffic (non-blocking)
-	peer.sendAsyncCover()
+	peer.sendCoverPacket()
 
 	msg, err := peer.device.CreateMessageInitiation(peer)
 	if err != nil {
@@ -476,8 +482,7 @@ func (device *Device) RoutineReadFromTUN() {
 		device.queue.encryption.wg.Done()
 	}()
 
-	// Initialize padding cache once at startup
-	initPaddingCache()
+	initJitterCache()
 
 	device.log.Verbosef("Routine: TUN reader - started")
 
@@ -506,7 +511,7 @@ func (device *Device) RoutineReadFromTUN() {
 		}
 	}()
 
-	tunMTU := int(device.tun.mtu.Load()) // Cache MTU
+	tunMTU := int(device.tun.mtu.Load())
 
 	for {
 		count, readErr = device.tun.device.Read(bufs, sizes, offset)
@@ -518,17 +523,15 @@ func (device *Device) RoutineReadFromTUN() {
 			elem := elems[i]
 			elem.packet = bufs[i][offset : offset+sizes[i]]
 
-			// OPTIMIZATION: Inline MSS clamping (no function call overhead)
 			if len(elem.packet) >= 40 {
-				ipVer := elem.packet[0] >> 4
-				if ipVer == 4 && elem.packet[9] == 6 {
-					clampTCPSYNMSSv4(elem.packet, tunMTU)
-				} else if ipVer == 6 && len(elem.packet) >= 60 && elem.packet[6] == 6 {
-					clampTCPSYNMSSv6(elem.packet, tunMTU)
+				ipVersion := elem.packet[0] >> 4
+				if ipVersion == 4 {
+					clampTCPMSSv4(elem.packet, tunMTU)
+				} else if ipVersion == 6 && len(elem.packet) >= 60 {
+					clampTCPMSSv6(elem.packet, tunMTU)
 				}
 			}
 
-			// Lookup peer
 			var peer *Peer
 			switch elem.packet[0] >> 4 {
 			case 4:
@@ -692,7 +695,6 @@ func (peer *Peer) FlushStagedPackets() {
 	}
 }
 
-// ZERO-LATENCY padding: use pre-computed cache
 func calculatePaddingSize(packetSize, mtu int) int {
 	lastUnit := packetSize
 	if mtu == 0 {
@@ -705,22 +707,11 @@ func calculatePaddingSize(packetSize, mtu int) int {
 	if paddedSize > mtu {
 		paddedSize = mtu
 	}
-
-	basePadding := paddedSize - lastUnit
-
-	// Fast random padding (0-16 bytes, lock-free)
-	if paddingCacheReady.Load() {
-		extra := fastRandInt(0, paddingExtraMax)
-		if basePadding+extra <= mtu-lastUnit {
-			return basePadding + extra
-		}
-	}
-
-	return basePadding
+	return paddedSize - lastUnit
 }
 
 func (device *Device) RoutineEncryption(id int) {
-	var paddingZeros [PaddingMultiple + paddingExtraMax]byte
+	var paddingZeros [PaddingMultiple]byte
 	var nonce [chacha20poly1305.NonceSize]byte
 
 	defer device.log.Verbosef("Routine: encryption worker %d - stopped", id)
@@ -737,9 +728,10 @@ func (device *Device) RoutineEncryption(id int) {
 			binary.LittleEndian.PutUint32(fieldReceiver, elem.keypair.remoteIndex)
 			binary.LittleEndian.PutUint64(fieldNonce, elem.nonce)
 
-			// ZERO-LATENCY: Pre-cached padding
 			paddingSize := calculatePaddingSize(len(elem.packet), int(device.tun.mtu.Load()))
 			elem.packet = append(elem.packet, paddingZeros[:paddingSize]...)
+
+			elem.packet = addJitterPadding(elem.packet)
 
 			binary.LittleEndian.PutUint64(nonce[4:], elem.nonce)
 			elem.packet = elem.keypair.send.Seal(header, nonce[:], elem.packet, nil)
