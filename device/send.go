@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
-	"math/big"
 	"net"
 	"os"
 	"sync"
@@ -36,66 +35,58 @@ const (
 	coverSizeMax    = 48
 	jitterMin       = 4
 	jitterMax       = 20
-	jitterCacheSize = 256
+	randomCacheSize = 512
 )
 
 var (
-	jitterCache     [jitterCacheSize]byte
-	jitterCacheIdx  atomic.Uint32
-	jitterCacheInit atomic.Bool
+	randomCache     [randomCacheSize]byte
+	randomCacheIdx  atomic.Uint32
+	randomCacheInit atomic.Bool
 )
 
-func initJitterCache() {
-	if jitterCacheInit.Load() {
+func initRandomCache() {
+	if randomCacheInit.Load() {
 		return
 	}
-	rand.Read(jitterCache[:])
-	jitterCacheInit.Store(true)
-}
-
-func secureRandInt(min, max int) (int, error) {
-	if max <= min {
-		return min, nil
-	}
-	n, err := rand.Int(rand.Reader, big.NewInt(int64(max-min+1)))
-	if err != nil {
-		return min, err
-	}
-	return min + int(n.Int64()), nil
-}
-
-func secureRandBytes(n int) ([]byte, error) {
-	if n <= 0 {
-		return nil, nil
-	}
-	b := make([]byte, n)
-	_, err := rand.Read(b)
-	return b, err
+	rand.Read(randomCache[:])
+	randomCacheInit.Store(true)
 }
 
 func fastRandInt(min, max int) int {
 	if max <= min {
 		return min
 	}
-	idx := jitterCacheIdx.Add(1) % jitterCacheSize
-	val := int(jitterCache[idx])
+	idx := randomCacheIdx.Add(1) % randomCacheSize
+	val := int(randomCache[idx])
 	return min + (val % (max - min + 1))
 }
 
+func fastRandBytes(n int) []byte {
+	if n <= 0 || n > randomCacheSize/2 {
+		return nil
+	}
+	idx := randomCacheIdx.Add(1) % randomCacheSize
+	result := make([]byte, n)
+	for i := 0; i < n; i++ {
+		result[i] = randomCache[(idx+uint32(i))%randomCacheSize]
+	}
+	return result
+}
+
 func (peer *Peer) sendCoverPacket() {
-	sz, err := secureRandInt(coverSizeMin, coverSizeMax)
-	if err != nil {
+	if !randomCacheInit.Load() {
 		return
 	}
-	b, err := secureRandBytes(sz)
-	if err != nil || len(b) == 0 {
+	sz := fastRandInt(coverSizeMin, coverSizeMax)
+	b := fastRandBytes(sz)
+	if len(b) == 0 {
 		return
 	}
 	_ = peer.SendBuffers([][]byte{b})
 }
 
 func addJitterPadding(pkt []byte) []byte {
-	if !jitterCacheInit.Load() {
+	if !randomCacheInit.Load() {
 		return pkt
 	}
 
@@ -104,8 +95,8 @@ func addJitterPadding(pkt []byte) []byte {
 		return pkt
 	}
 
-	idx := jitterCacheIdx.Add(1) % jitterCacheSize
-	patternType := jitterCache[idx] & 0x03
+	idx := randomCacheIdx.Add(1) % randomCacheSize
+	patternType := randomCache[idx] & 0x03
 
 	padding := make([]byte, extra)
 	switch patternType {
@@ -118,15 +109,15 @@ func addJitterPadding(pkt []byte) []byte {
 			padding[i] = byte(i & 0xFF)
 		}
 	case 2:
-		fillIdx := jitterCacheIdx.Add(1) % jitterCacheSize
-		fillByte := jitterCache[fillIdx]
+		fillIdx := randomCacheIdx.Add(1) % randomCacheSize
+		fillByte := randomCache[fillIdx]
 		for i := range padding {
 			padding[i] = fillByte
 		}
 	case 3:
 		for i := 0; i < extra; i++ {
-			cacheIdx := (idx + uint32(i)) % jitterCacheSize
-			padding[i] = jitterCache[cacheIdx]
+			cacheIdx := (idx + uint32(i)) % randomCacheSize
+			padding[i] = randomCache[cacheIdx]
 		}
 	}
 
@@ -482,7 +473,7 @@ func (device *Device) RoutineReadFromTUN() {
 		device.queue.encryption.wg.Done()
 	}()
 
-	initJitterCache()
+	initRandomCache()
 
 	device.log.Verbosef("Routine: TUN reader - started")
 
