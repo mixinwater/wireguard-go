@@ -7,7 +7,6 @@ import (
 	"net"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -31,74 +30,198 @@ type QueueOutboundElementsContainer struct {
 }
 
 const (
-	coverSizeMin    = 24
-	coverSizeMax    = 48
-	jitterMin       = 4
-	jitterMax       = 20
-	randomCacheSize = 512
+	coverSizeMin     = 24
+	coverSizeMax     = 48
+	jitterMin        = 4
+	jitterMax        = 20
+	randomPoolSize   = 4096
+	randomChunkSize  = 256
+	coverIntervalMin = 8 * time.Second
+	coverIntervalMax = 25 * time.Second
+	coverBurstMin    = 1
+	coverBurstMax    = 3
+	coverIdleMax     = 60 * time.Second
 )
+
+type randomPool struct {
+	mu      sync.Mutex
+	pool    []byte
+	offset  int
+	refresh chan struct{}
+}
 
 var (
-	randomCache     [randomCacheSize]byte
-	randomCacheIdx  atomic.Uint32
-	randomCacheInit atomic.Bool
+	globalRandomPool *randomPool
+	poolInitOnce     sync.Once
 )
 
-func initRandomCache() {
-	if randomCacheInit.Load() {
-		return
-	}
-	rand.Read(randomCache[:])
-	randomCacheInit.Store(true)
+func initRandomPool() {
+	poolInitOnce.Do(func() {
+		globalRandomPool = &randomPool{
+			pool:    make([]byte, randomPoolSize),
+			offset:  0,
+			refresh: make(chan struct{}, 1),
+		}
+		rand.Read(globalRandomPool.pool)
+		go globalRandomPool.refresher()
+	})
 }
 
-func fastRandInt(min, max int) int {
-	if max <= min {
-		return min
+func (rp *randomPool) refresher() {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			rp.mu.Lock()
+			if rp.offset > randomPoolSize/2 {
+				rand.Read(rp.pool)
+				rp.offset = 0
+			}
+			rp.mu.Unlock()
+		case <-rp.refresh:
+			rp.mu.Lock()
+			rand.Read(rp.pool)
+			rp.offset = 0
+			rp.mu.Unlock()
+		}
 	}
-	idx := randomCacheIdx.Add(1) % randomCacheSize
-	val := int(randomCache[idx])
-	return min + (val % (max - min + 1))
 }
 
-func fastRandBytes(n int) []byte {
-	if n <= 0 || n > randomCacheSize/2 {
-		return nil
+func (rp *randomPool) getBytes(n int) []byte {
+	if n <= 0 || n > randomChunkSize {
+		b := make([]byte, n)
+		rand.Read(b)
+		return b
 	}
-	idx := randomCacheIdx.Add(1) % randomCacheSize
+
+	rp.mu.Lock()
+	defer rp.mu.Unlock()
+
+	if rp.offset+n > randomPoolSize {
+		select {
+		case rp.refresh <- struct{}{}:
+		default:
+		}
+		b := make([]byte, n)
+		rand.Read(b)
+		return b
+	}
+
 	result := make([]byte, n)
-	for i := 0; i < n; i++ {
-		result[i] = randomCache[(idx+uint32(i))%randomCacheSize]
-	}
+	copy(result, rp.pool[rp.offset:rp.offset+n])
+	rp.offset += n
+
 	return result
 }
 
-func (peer *Peer) sendCoverPacket() {
-	if !randomCacheInit.Load() {
-		return
+func (rp *randomPool) getInt(min, max int) int {
+	if max <= min {
+		return min
 	}
-	sz := fastRandInt(coverSizeMin, coverSizeMax)
-	b := fastRandBytes(sz)
+
+	rp.mu.Lock()
+	defer rp.mu.Unlock()
+
+	if rp.offset+1 > randomPoolSize {
+		select {
+		case rp.refresh <- struct{}{}:
+		default:
+		}
+		var b [1]byte
+		rand.Read(b[:])
+		return min + (int(b[0]) % (max - min + 1))
+	}
+
+	val := int(rp.pool[rp.offset])
+	rp.offset++
+	return min + (val % (max - min + 1))
+}
+
+func (rp *randomPool) getDuration(min, max time.Duration) time.Duration {
+	if max <= min {
+		return min
+	}
+	spread := int64(max - min)
+	rval := int64(rp.getInt(0, int(spread)))
+	return min + time.Duration(rval)
+}
+
+func (peer *Peer) sendCoverPacket() error {
+	if globalRandomPool == nil {
+		return nil
+	}
+	sz := globalRandomPool.getInt(coverSizeMin, coverSizeMax)
+	b := globalRandomPool.getBytes(sz)
 	if len(b) == 0 {
+		return errors.New("failed to generate cover packet")
+	}
+	return peer.SendBuffers([][]byte{b})
+}
+
+func (peer *Peer) RoutineCoverTraffic() {
+	defer func() {
+		peer.device.log.Verbosef("%v - Routine: cover traffic - stopped", peer)
+		peer.stopping.Done()
+	}()
+	peer.device.log.Verbosef("%v - Routine: cover traffic - started", peer)
+
+	if globalRandomPool == nil {
 		return
 	}
-	_ = peer.SendBuffers([][]byte{b})
+
+	lastActivity := time.Now()
+	ticker := time.NewTicker(coverIntervalMin)
+	defer ticker.Stop()
+
+	for peer.isRunning.Load() {
+		interval := globalRandomPool.getDuration(coverIntervalMin, coverIntervalMax)
+		ticker.Reset(interval)
+
+		select {
+		case <-ticker.C:
+			if !peer.isRunning.Load() {
+				return
+			}
+
+			if time.Since(lastActivity) > coverIdleMax {
+				continue
+			}
+
+			burst := globalRandomPool.getInt(coverBurstMin, coverBurstMax)
+			for i := 0; i < burst; i++ {
+				if !peer.isRunning.Load() {
+					return
+				}
+
+				err := peer.sendCoverPacket()
+				if err == nil {
+					lastActivity = time.Now()
+				}
+
+				if i < burst-1 {
+					jitter := globalRandomPool.getDuration(50*time.Millisecond, 300*time.Millisecond)
+					time.Sleep(jitter)
+				}
+			}
+		}
+	}
 }
 
 func addJitterPadding(pkt []byte) []byte {
-	if !randomCacheInit.Load() {
+	if globalRandomPool == nil {
 		return pkt
 	}
 
-	extra := fastRandInt(jitterMin, jitterMax)
+	extra := globalRandomPool.getInt(jitterMin, jitterMax)
 	if extra <= 0 || len(pkt)+extra > MaxMessageSize-chacha20poly1305.Overhead {
 		return pkt
 	}
 
-	idx := randomCacheIdx.Add(1) % randomCacheSize
-	patternType := randomCache[idx] & 0x03
-
+	patternType := globalRandomPool.getInt(0, 3)
 	padding := make([]byte, extra)
+
 	switch patternType {
 	case 0:
 		for i := range padding {
@@ -109,16 +232,12 @@ func addJitterPadding(pkt []byte) []byte {
 			padding[i] = byte(i & 0xFF)
 		}
 	case 2:
-		fillIdx := randomCacheIdx.Add(1) % randomCacheSize
-		fillByte := randomCache[fillIdx]
+		fillByte := globalRandomPool.getBytes(1)[0]
 		for i := range padding {
 			padding[i] = fillByte
 		}
 	case 3:
-		for i := 0; i < extra; i++ {
-			cacheIdx := (idx + uint32(i)) % randomCacheSize
-			padding[i] = randomCache[cacheIdx]
-		}
+		copy(padding, globalRandomPool.getBytes(extra))
 	}
 
 	return append(pkt, padding...)
@@ -380,7 +499,19 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 
 	peer.device.log.Verbosef("%v - Sending handshake initiation", peer)
 
-	peer.sendCoverPacket()
+	if globalRandomPool != nil {
+		burst := globalRandomPool.getInt(1, 2)
+		for i := 0; i < burst; i++ {
+			err := peer.sendCoverPacket()
+			if err != nil {
+				peer.device.log.Verbosef("%v - Cover packet send failed: %v", peer, err)
+			}
+			if i < burst-1 {
+				jitter := globalRandomPool.getDuration(20*time.Millisecond, 100*time.Millisecond)
+				time.Sleep(jitter)
+			}
+		}
+	}
 
 	msg, err := peer.device.CreateMessageInitiation(peer)
 	if err != nil {
@@ -473,7 +604,7 @@ func (device *Device) RoutineReadFromTUN() {
 		device.queue.encryption.wg.Done()
 	}()
 
-	initRandomCache()
+	initRandomPool()
 
 	device.log.Verbosef("Routine: TUN reader - started")
 
