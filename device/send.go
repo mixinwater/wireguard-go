@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -15,6 +16,27 @@ import (
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/tun"
 )
+
+type sizeProfile int
+
+const (
+	profileSmall  sizeProfile = 256
+	profileMedium sizeProfile = 512
+	profileLarge  sizeProfile = 1024
+	profileJumbo  sizeProfile = 1200
+)
+
+var sizeProfiles = []sizeProfile{
+	profileSmall,
+	profileMedium,
+	profileLarge,
+	profileJumbo,
+}
+
+type obfuscationState struct {
+	sizeProfile     sizeProfile
+	lastRealTraffic atomic.Int64
+}
 
 type QueueOutboundElement struct {
 	buffer  *[MaxMessageSize]byte
@@ -30,215 +52,105 @@ type QueueOutboundElementsContainer struct {
 }
 
 const (
-	coverSizeMin     = 24
-	coverSizeMax     = 48
-	jitterMin        = 4
-	jitterMax        = 20
-	randomPoolSize   = 4096
-	randomChunkSize  = 256
-	coverIntervalMin = 8 * time.Second
-	coverIntervalMax = 25 * time.Second
-	coverBurstMin    = 1
-	coverBurstMax    = 3
-	coverIdleMax     = 60 * time.Second
+	handshakePrePacketMin = 16
+	handshakePrePacketMax = 32
 )
-
-type randomPool struct {
-	mu      sync.Mutex
-	pool    []byte
-	offset  int
-	refresh chan struct{}
-}
 
 var (
-	globalRandomPool *randomPool
-	poolInitOnce     sync.Once
+	peerObfuscation   = make(map[*Peer]*obfuscationState)
+	peerObfuscationMu sync.RWMutex
 )
 
-func initRandomPool() {
-	poolInitOnce.Do(func() {
-		globalRandomPool = &randomPool{
-			pool:    make([]byte, randomPoolSize),
-			offset:  0,
-			refresh: make(chan struct{}, 1),
-		}
-		rand.Read(globalRandomPool.pool)
-		go globalRandomPool.refresher()
-	})
+func getPeerObfuscation(peer *Peer) *obfuscationState {
+	peerObfuscationMu.RLock()
+	state := peerObfuscation[peer]
+	peerObfuscationMu.RUnlock()
+	return state
 }
 
-func (rp *randomPool) refresher() {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
+func initPeerObfuscation(peer *Peer) *obfuscationState {
+	peerObfuscationMu.Lock()
+	defer peerObfuscationMu.Unlock()
 
-	for {
-		select {
-		case <-ticker.C:
-			rp.mu.Lock()
-			if rp.offset > randomPoolSize/2 {
-				rand.Read(rp.pool)
-				rp.offset = 0
-			}
-			rp.mu.Unlock()
-		case <-rp.refresh:
-			rp.mu.Lock()
-			rand.Read(rp.pool)
-			rp.offset = 0
-			rp.mu.Unlock()
-		}
+	if state, ok := peerObfuscation[peer]; ok {
+		return state
 	}
+
+	state := &obfuscationState{}
+	var profileIndex [1]byte
+	rand.Read(profileIndex[:])
+	state.sizeProfile = sizeProfiles[int(profileIndex[0])%len(sizeProfiles)]
+	state.lastRealTraffic.Store(time.Now().Unix())
+	peerObfuscation[peer] = state
+	return state
 }
 
-func (rp *randomPool) getBytes(n int) []byte {
-	if n <= 0 || n > randomChunkSize {
-		b := make([]byte, n)
-		rand.Read(b)
-		return b
-	}
-
-	rp.mu.Lock()
-	defer rp.mu.Unlock()
-
-	if rp.offset+n > randomPoolSize {
-		select {
-		case rp.refresh <- struct{}{}:
-		default:
-		}
-		b := make([]byte, n)
-		rand.Read(b)
-		return b
-	}
-
-	result := make([]byte, n)
-	copy(result, rp.pool[rp.offset:rp.offset+n])
-	rp.offset += n
-
-	return result
+func cleanupPeerObfuscation(peer *Peer) {
+	peerObfuscationMu.Lock()
+	delete(peerObfuscation, peer)
+	peerObfuscationMu.Unlock()
 }
 
-func (rp *randomPool) getInt(min, max int) int {
-	if max <= min {
-		return min
+func shouldSendCamouflage(peer *Peer) bool {
+	state := getPeerObfuscation(peer)
+	if state == nil {
+		return false
 	}
-
-	rp.mu.Lock()
-	defer rp.mu.Unlock()
-
-	if rp.offset+1 > randomPoolSize {
-		select {
-		case rp.refresh <- struct{}{}:
-		default:
-		}
-		var b [1]byte
-		rand.Read(b[:])
-		return min + (int(b[0]) % (max - min + 1))
+	lastTraffic := state.lastRealTraffic.Load()
+	if time.Now().Unix()-lastTraffic > 60 {
+		return false
 	}
-
-	val := int(rp.pool[rp.offset])
-	rp.offset++
-	return min + (val % (max - min + 1))
+	var coin [1]byte
+	rand.Read(coin[:])
+	return coin[0]%20 == 0
 }
 
-func (rp *randomPool) getDuration(min, max time.Duration) time.Duration {
-	if max <= min {
-		return min
-	}
-	spread := int64(max - min)
-	rval := int64(rp.getInt(0, int(spread)))
-	return min + time.Duration(rval)
-}
-
-func (peer *Peer) sendCoverPacket() error {
-	if globalRandomPool == nil {
+func sendCamouflagePacket(peer *Peer) error {
+	state := getPeerObfuscation(peer)
+	if state == nil {
 		return nil
 	}
-	sz := globalRandomPool.getInt(coverSizeMin, coverSizeMax)
-	b := globalRandomPool.getBytes(sz)
-	if len(b) == 0 {
-		return errors.New("failed to generate cover packet")
-	}
+	targetSize := int(state.sizeProfile)
+	b := make([]byte, targetSize)
+	rand.Read(b)
 	return peer.SendBuffers([][]byte{b})
 }
 
-func (peer *Peer) RoutineCoverTraffic() {
-	defer func() {
-		peer.device.log.Verbosef("%v - Routine: cover traffic - stopped", peer)
-		peer.stopping.Done()
-	}()
-	peer.device.log.Verbosef("%v - Routine: cover traffic - started", peer)
+func sendHandshakePrePackets(peer *Peer) {
+	var sizeBytes [1]byte
+	rand.Read(sizeBytes[:])
+	size := handshakePrePacketMin + int(sizeBytes[0])%(handshakePrePacketMax-handshakePrePacketMin+1)
 
-	if globalRandomPool == nil {
-		return
-	}
+	prePacket := make([]byte, size)
+	rand.Read(prePacket)
 
-	lastActivity := time.Now()
-	ticker := time.NewTicker(coverIntervalMin)
-	defer ticker.Stop()
+	peer.SendBuffers([][]byte{prePacket})
 
-	for peer.isRunning.Load() {
-		interval := globalRandomPool.getDuration(coverIntervalMin, coverIntervalMax)
-		ticker.Reset(interval)
-
-		select {
-		case <-ticker.C:
-			if !peer.isRunning.Load() {
-				return
-			}
-
-			if time.Since(lastActivity) > coverIdleMax {
-				continue
-			}
-
-			burst := globalRandomPool.getInt(coverBurstMin, coverBurstMax)
-			for i := 0; i < burst; i++ {
-				if !peer.isRunning.Load() {
-					return
-				}
-
-				err := peer.sendCoverPacket()
-				if err == nil {
-					lastActivity = time.Now()
-				}
-
-				if i < burst-1 {
-					jitter := globalRandomPool.getDuration(50*time.Millisecond, 300*time.Millisecond)
-					time.Sleep(jitter)
-				}
-			}
-		}
+	var doSecond [1]byte
+	rand.Read(doSecond[:])
+	if doSecond[0]%2 == 0 {
+		time.Sleep(5 * time.Millisecond)
+		rand.Read(sizeBytes[:])
+		size = handshakePrePacketMin + int(sizeBytes[0])%(handshakePrePacketMax-handshakePrePacketMin+1)
+		prePacket = make([]byte, size)
+		rand.Read(prePacket)
+		peer.SendBuffers([][]byte{prePacket})
 	}
 }
 
-func addJitterPadding(pkt []byte) []byte {
-	if globalRandomPool == nil {
+func padToProfile(pkt []byte, profile sizeProfile, maxSize int) []byte {
+	targetSize := int(profile)
+	if targetSize > maxSize {
+		targetSize = maxSize
+	}
+
+	currentSize := len(pkt)
+	if currentSize >= targetSize {
 		return pkt
 	}
 
-	extra := globalRandomPool.getInt(jitterMin, jitterMax)
-	if extra <= 0 || len(pkt)+extra > MaxMessageSize-chacha20poly1305.Overhead {
-		return pkt
-	}
-
-	patternType := globalRandomPool.getInt(0, 3)
-	padding := make([]byte, extra)
-
-	switch patternType {
-	case 0:
-		for i := range padding {
-			padding[i] = 0x00
-		}
-	case 1:
-		for i := range padding {
-			padding[i] = byte(i & 0xFF)
-		}
-	case 2:
-		fillByte := globalRandomPool.getBytes(1)[0]
-		for i := range padding {
-			padding[i] = fillByte
-		}
-	case 3:
-		copy(padding, globalRandomPool.getBytes(extra))
-	}
+	paddingSize := targetSize - currentSize
+	padding := make([]byte, paddingSize)
 
 	return append(pkt, padding...)
 }
@@ -499,19 +411,7 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 
 	peer.device.log.Verbosef("%v - Sending handshake initiation", peer)
 
-	if globalRandomPool != nil {
-		burst := globalRandomPool.getInt(1, 2)
-		for i := 0; i < burst; i++ {
-			err := peer.sendCoverPacket()
-			if err != nil {
-				peer.device.log.Verbosef("%v - Cover packet send failed: %v", peer, err)
-			}
-			if i < burst-1 {
-				jitter := globalRandomPool.getDuration(20*time.Millisecond, 100*time.Millisecond)
-				time.Sleep(jitter)
-			}
-		}
-	}
+	sendHandshakePrePackets(peer)
 
 	msg, err := peer.device.CreateMessageInitiation(peer)
 	if err != nil {
@@ -604,8 +504,6 @@ func (device *Device) RoutineReadFromTUN() {
 		device.queue.encryption.wg.Done()
 	}()
 
-	initRandomPool()
-
 	device.log.Verbosef("Routine: TUN reader - started")
 
 	var (
@@ -677,6 +575,10 @@ func (device *Device) RoutineReadFromTUN() {
 			if peer == nil {
 				continue
 			}
+
+			state := initPeerObfuscation(peer)
+			state.lastRealTraffic.Store(time.Now().Unix())
+
 			elemsForPeer, ok := elemsByPeer[peer]
 			if !ok {
 				elemsForPeer = device.GetOutboundElementsContainer()
@@ -690,6 +592,11 @@ func (device *Device) RoutineReadFromTUN() {
 		for peer, elemsForPeer := range elemsByPeer {
 			if peer.isRunning.Load() {
 				peer.StagePackets(elemsForPeer)
+
+				if shouldSendCamouflage(peer) {
+					go sendCamouflagePacket(peer)
+				}
+
 				peer.SendStagedPackets()
 			} else {
 				for _, elem := range elemsForPeer.elems {
@@ -853,7 +760,14 @@ func (device *Device) RoutineEncryption(id int) {
 			paddingSize := calculatePaddingSize(len(elem.packet), int(device.tun.mtu.Load()))
 			elem.packet = append(elem.packet, paddingZeros[:paddingSize]...)
 
-			elem.packet = addJitterPadding(elem.packet)
+			tunMTU := int(device.tun.mtu.Load())
+			maxSafeSize := tunMTU - MessageTransportHeaderSize - chacha20poly1305.Overhead
+
+			if elem.peer != nil {
+				if state := getPeerObfuscation(elem.peer); state != nil {
+					elem.packet = padToProfile(elem.packet, state.sizeProfile, maxSafeSize)
+				}
+			}
 
 			binary.LittleEndian.PutUint64(nonce[4:], elem.nonce)
 			elem.packet = elem.keypair.send.Seal(header, nonce[:], elem.packet, nil)
@@ -867,6 +781,7 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 	defer func() {
 		defer device.log.Verbosef("%v - Routine: sequential sender - stopped", peer)
 		peer.stopping.Done()
+		cleanupPeerObfuscation(peer)
 	}()
 	device.log.Verbosef("%v - Routine: sequential sender - started", peer)
 
