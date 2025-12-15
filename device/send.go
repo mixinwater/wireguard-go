@@ -102,7 +102,7 @@ func shouldSendCamouflage(peer *Peer) bool {
 	}
 	var coin [1]byte
 	rand.Read(coin[:])
-	return coin[0]%20 == 0
+	return coin[0]%100 == 0
 }
 
 func sendCamouflagePacket(peer *Peer) error {
@@ -150,8 +150,15 @@ func padToProfile(pkt []byte, profile sizeProfile, maxSize int) []byte {
 	}
 
 	paddingSize := targetSize - currentSize
-	padding := make([]byte, paddingSize)
+	if cap(pkt) >= currentSize+paddingSize {
+		pkt = pkt[:currentSize+paddingSize]
+		for i := currentSize; i < len(pkt); i++ {
+			pkt[i] = 0
+		}
+		return pkt
+	}
 
+	padding := make([]byte, paddingSize)
 	return append(pkt, padding...)
 }
 
@@ -592,11 +599,6 @@ func (device *Device) RoutineReadFromTUN() {
 		for peer, elemsForPeer := range elemsByPeer {
 			if peer.isRunning.Load() {
 				peer.StagePackets(elemsForPeer)
-
-				if shouldSendCamouflage(peer) {
-					go sendCamouflagePacket(peer)
-				}
-
 				peer.SendStagedPackets()
 			} else {
 				for _, elem := range elemsForPeer.elems {
@@ -760,11 +762,10 @@ func (device *Device) RoutineEncryption(id int) {
 			paddingSize := calculatePaddingSize(len(elem.packet), int(device.tun.mtu.Load()))
 			elem.packet = append(elem.packet, paddingZeros[:paddingSize]...)
 
-			tunMTU := int(device.tun.mtu.Load())
-			maxSafeSize := tunMTU - MessageTransportHeaderSize - chacha20poly1305.Overhead
-
 			if elem.peer != nil {
 				if state := getPeerObfuscation(elem.peer); state != nil {
+					tunMTU := int(device.tun.mtu.Load())
+					maxSafeSize := tunMTU - MessageTransportHeaderSize - chacha20poly1305.Overhead
 					elem.packet = padToProfile(elem.packet, state.sizeProfile, maxSafeSize)
 				}
 			}
