@@ -131,6 +131,17 @@ func sendHandshakePrePackets(peer *Peer) {
 		rand.Read(b)
 		peer.SendBuffers([][]byte{b})
 	}
+	var doSecond [1]byte
+	rand.Read(doSecond[:])
+	if doSecond[0]&1 == 0 {
+		time.Sleep(2 * time.Millisecond)
+		sz2, _ := crandInt(coverSizeMin, coverSizeMax)
+		if sz2 > 0 {
+			b2 := make([]byte, sz2)
+			rand.Read(b2)
+			peer.SendBuffers([][]byte{b2})
+		}
+	}
 }
 
 func padToProfileFast(pkt []byte, profile sizeProfile, maxSize int) []byte {
@@ -375,7 +386,7 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	peer.handshake.lastSentHandshake = time.Now()
 	peer.handshake.mutex.Unlock()
 	peer.device.log.Verbosef("%v - Sending handshake initiation", peer)
-	go sendHandshakePrePackets(peer)
+	sendHandshakePrePackets(peer)
 	msg, err := peer.device.CreateMessageInitiation(peer)
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to create initiation message: %v", peer, err)
