@@ -1,16 +1,14 @@
-/* SPDX-License-Identifier: MIT
- *
- * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
- */
-
 package device
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"math/big"
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -20,36 +18,55 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 )
 
-/* Outbound flow
- *
- * 1. TUN queue
- * 2. Routing (sequential)
- * 3. Nonce assignment (sequential)
- * 4. Encryption (parallel)
- * 5. Transmission (sequential)
- *
- * The functions in this file occur (roughly) in the order in
- * which the packets are processed.
- *
- * Locking, Producers and Consumers
- *
- * The order of packets (per peer) must be maintained,
- * but encryption of packets happen out-of-order:
- *
- * The sequential consumers will attempt to take the lock,
- * workers release lock when they have completed work (encryption) on the packet.
- *
- * If the element is inserted into the "encryption queue",
- * the content is preceded by enough "junk" to contain the transport header
- * (to allow the construction of transport messages in-place)
- */
+type sizeProfile int
+
+const (
+	profileSmall  sizeProfile = 256
+	profileMedium sizeProfile = 512
+	profileLarge  sizeProfile = 1024
+	profileJumbo  sizeProfile = 1200
+)
+
+var sizeProfiles = [4]sizeProfile{profileSmall, profileMedium, profileLarge, profileJumbo}
+
+type obfuscationState struct {
+	sizeProfile              sizeProfile
+	lastRealTraffic          int64
+	lastSuccessfulSend       int64
+	lastPatternChange        int64
+	lastKeepalive            int64
+	lastReceived             int64
+	lastHandshake            int64
+	lastHandshakeResponse    int64
+	lastRecoveryAttempt      int64
+	coinCounter              uint32
+	successCount             uint32
+	totalCount               uint32
+	failureStreak            uint32
+	profileRotation          int64
+	burstCounter             uint32
+	lastBurst                int64
+	timeJitter               int32
+	paddingVariance          int32
+	prePacketCount           int32
+	camouflageFreq           int32
+	lastHealthCheck          int64
+	activePattern            int32
+	recoveryMode             int32
+	connectionStale          int32
+	forceRehandshake         int32
+	recoveryAttempts         uint32
+	handshakeAttempts        uint32
+	consecutiveFailedHandshakes uint32
+	randomizedObfuscation    int32
+}
 
 type QueueOutboundElement struct {
-	buffer  *[MaxMessageSize]byte // slice holding the packet data
-	packet  []byte                // slice of "buffer" (always!)
-	nonce   uint64                // nonce for encryption
-	keypair *Keypair              // keypair for encryption
-	peer    *Peer                 // related peer
+	buffer  *[MaxMessageSize]byte
+	packet  []byte
+	nonce   uint64
+	keypair *Keypair
+	peer    *Peer
 }
 
 type QueueOutboundElementsContainer struct {
@@ -57,18 +74,747 @@ type QueueOutboundElementsContainer struct {
 	elems []*QueueOutboundElement
 }
 
+const (
+	coverSizeMin                = 16
+	coverSizeMax                = 64
+	profileRotationInterval     = 120
+	burstWindow                 = 3
+	burstThreshold              = 15
+	healthCheckInterval         = 2
+	trafficTimeoutNormal        = 15
+	trafficTimeoutRecovery      = 8
+	patternChangeInterval       = 300
+	failureStreakThreshold      = 3
+	keepaliveInterval           = 8
+	idleTimeout                 = 60
+	staleConnectionTimeout      = 25
+	probeInterval               = 5
+	handshakeTimeout            = 35
+	handshakeResponseTimeout    = 10
+	recoveryCheckInterval       = 1
+	maxRecoveryAttempts         = 3
+	forceRehandshakeInterval    = 30
+	aggressiveRecoveryInterval  = 20
+	handshakeBlockedThreshold   = 5
+)
+
+var (
+	peerObfuscation   = make(map[*Peer]*obfuscationState)
+	peerObfuscationMu sync.RWMutex
+)
+
+func getPeerObfuscation(peer *Peer) *obfuscationState {
+	peerObfuscationMu.RLock()
+	state := peerObfuscation[peer]
+	peerObfuscationMu.RUnlock()
+	return state
+}
+
+func initPeerObfuscation(peer *Peer) *obfuscationState {
+	peerObfuscationMu.Lock()
+	defer peerObfuscationMu.Unlock()
+
+	if state, ok := peerObfuscation[peer]; ok {
+		return state
+	}
+
+	state := &obfuscationState{}
+	var profileIndex [1]byte
+	rand.Read(profileIndex[:])
+	state.sizeProfile = sizeProfiles[int(profileIndex[0])&3]
+	now := time.Now().Unix()
+	state.lastRealTraffic = now
+	state.lastSuccessfulSend = now
+	state.lastPatternChange = now
+	state.lastKeepalive = now
+	state.lastReceived = now
+	state.lastHandshake = now
+	state.lastHandshakeResponse = now
+	state.lastRecoveryAttempt = now
+	state.profileRotation = now
+	state.lastHealthCheck = now
+	state.timeJitter = 1
+	state.paddingVariance = 160
+	state.prePacketCount = 3
+	state.camouflageFreq = 6
+	state.activePattern = 0
+	state.recoveryMode = 0
+	state.connectionStale = 0
+	state.forceRehandshake = 0
+	state.recoveryAttempts = 0
+	state.handshakeAttempts = 0
+	state.consecutiveFailedHandshakes = 0
+	state.randomizedObfuscation = 1
+	peerObfuscation[peer] = state
+	
+	peer.device.log.Verbosef("OBF: Initialized obfuscation for peer %v - Profile: %d, Pattern: 0, RANDOMIZED MODE", peer, state.sizeProfile)
+	
+	go monitorConnectionHealth(peer, state)
+	
+	return state
+}
+
+func cleanupPeerObfuscation(peer *Peer) {
+	peerObfuscationMu.Lock()
+	delete(peerObfuscation, peer)
+	peerObfuscationMu.Unlock()
+}
+
+func monitorConnectionHealth(peer *Peer, state *obfuscationState) {
+	ticker := time.NewTicker(time.Duration(recoveryCheckInterval) * time.Second)
+	defer ticker.Stop()
+	
+	peer.device.log.Verbosef("OBF: Started connection monitor for peer %v", peer)
+	
+	for {
+		if !peer.isRunning.Load() {
+			peer.device.log.Verbosef("OBF: Stopping connection monitor for peer %v", peer)
+			return
+		}
+		
+		<-ticker.C
+		
+		now := time.Now().Unix()
+		lastReceived := atomic.LoadInt64(&state.lastReceived)
+		lastHandshake := atomic.LoadInt64(&state.lastHandshake)
+		lastHandshakeResponse := atomic.LoadInt64(&state.lastHandshakeResponse)
+		lastSuccess := atomic.LoadInt64(&state.lastSuccessfulSend)
+		lastRecovery := atomic.LoadInt64(&state.lastRecoveryAttempt)
+		recoveryMode := atomic.LoadInt32(&state.recoveryMode)
+		
+		timeSinceReceived := now - lastReceived
+		timeSinceSuccess := now - lastSuccess
+		timeSinceHandshake := now - lastHandshake
+		timeSinceHandshakeResponse := now - lastHandshakeResponse
+		
+		failedHandshakes := atomic.LoadUint32(&state.consecutiveFailedHandshakes)
+		if failedHandshakes >= handshakeBlockedThreshold {
+			peer.device.log.Verbosef("OBF: HANDSHAKE BLOCKING DETECTED - %d consecutive failures, enabling randomized obfuscation", failedHandshakes)
+			atomic.StoreInt32(&state.randomizedObfuscation, 1)
+			atomic.StoreUint32(&state.consecutiveFailedHandshakes, 0)
+			atomic.StoreInt32(&state.recoveryMode, 1)
+			time.Sleep(time.Duration(crandIntUnsafe(500, 2000)) * time.Millisecond)
+		}
+		
+		if timeSinceHandshake < handshakeResponseTimeout && timeSinceHandshakeResponse > handshakeResponseTimeout && timeSinceHandshake > 5 {
+			attempts := atomic.AddUint32(&state.handshakeAttempts, 1)
+			if attempts > 3 {
+				peer.device.log.Verbosef("OBF: Handshakes timing out (%d attempts), likely being blocked", attempts)
+				failedCount := atomic.AddUint32(&state.consecutiveFailedHandshakes, 1)
+				if failedCount >= handshakeBlockedThreshold {
+					atomic.StoreInt32(&state.randomizedObfuscation, 1)
+					peer.device.log.Verbosef("OBF: ENABLING RANDOMIZED OBFUSCATION MODE")
+				}
+			}
+		}
+		
+		if timeSinceReceived > staleConnectionTimeout {
+			if atomic.CompareAndSwapInt32(&state.connectionStale, 0, 1) {
+				peer.device.log.Verbosef("OBF: STALE CONNECTION DETECTED - No RX for %ds, triggering recovery", timeSinceReceived)
+				atomic.StoreInt32(&state.recoveryMode, 1)
+				atomic.StoreInt32(&state.randomizedObfuscation, 1)
+				changeObfuscationPattern(state, true)
+				atomic.StoreInt32(&state.forceRehandshake, 1)
+			}
+		}
+		
+		if timeSinceSuccess > trafficTimeoutNormal {
+			if recoveryMode == 0 {
+				peer.device.log.Verbosef("OBF: Traffic timeout detected (%ds without successful send), entering recovery mode", timeSinceSuccess)
+				atomic.StoreInt32(&state.recoveryMode, 1)
+				changeObfuscationPattern(state, true)
+				atomic.StoreInt32(&state.forceRehandshake, 1)
+			}
+		}
+		
+		if timeSinceHandshake > handshakeTimeout {
+			peer.device.log.Verbosef("OBF: Handshake timeout (%ds), forcing rehandshake", timeSinceHandshake)
+			atomic.StoreInt32(&state.forceRehandshake, 1)
+		}
+		
+		if recoveryMode > 0 && now-lastRecovery > aggressiveRecoveryInterval {
+			attempts := atomic.AddUint32(&state.recoveryAttempts, 1)
+			atomic.StoreInt64(&state.lastRecoveryAttempt, now)
+			
+			peer.device.log.Verbosef("OBF: AGGRESSIVE RECOVERY attempt #%d (RX: %ds ago, TX: %ds ago)", 
+				attempts, timeSinceReceived, timeSinceSuccess)
+			
+			changeObfuscationPattern(state, true)
+			atomic.StoreInt32(&state.forceRehandshake, 1)
+			
+			if attempts >= maxRecoveryAttempts {
+				peer.device.log.Verbosef("OBF: Maximum recovery attempts reached, switching to full randomization")
+				atomic.StoreInt32(&state.randomizedObfuscation, 1)
+				atomic.StoreUint32(&state.recoveryAttempts, 0)
+			}
+		}
+		
+		if atomic.LoadInt32(&state.forceRehandshake) > 0 {
+			atomic.StoreInt32(&state.forceRehandshake, 0)
+			atomic.StoreInt64(&state.lastHandshake, now)
+			peer.device.log.Verbosef("OBF: Forcing handshake initiation")
+			peer.SendHandshakeInitiation(true)
+		}
+		
+		lastKeepalive := atomic.LoadInt64(&state.lastKeepalive)
+		if now-lastKeepalive > keepaliveInterval {
+			atomic.StoreInt64(&state.lastKeepalive, now)
+			peer.SendKeepalive()
+		}
+		
+		lastRealTraffic := atomic.LoadInt64(&state.lastRealTraffic)
+		if now-lastRealTraffic > idleTimeout && now-lastKeepalive > probeInterval {
+			atomic.StoreInt64(&state.lastKeepalive, now)
+			peer.SendKeepalive()
+		}
+	}
+}
+
+func checkTrafficHealth(peer *Peer, state *obfuscationState) {
+	now := time.Now().Unix()
+	lastCheck := atomic.LoadInt64(&state.lastHealthCheck)
+	
+	if now-lastCheck < healthCheckInterval {
+		return
+	}
+	
+	atomic.StoreInt64(&state.lastHealthCheck, now)
+	
+	lastSuccess := atomic.LoadInt64(&state.lastSuccessfulSend)
+	recoveryMode := atomic.LoadInt32(&state.recoveryMode)
+	
+	timeout := trafficTimeoutNormal
+	if recoveryMode > 0 {
+		timeout = trafficTimeoutRecovery
+	}
+	
+	if now-lastSuccess > int64(timeout) {
+		if recoveryMode == 0 {
+			peer.device.log.Verbosef("OBF: Health check failed - entering recovery mode")
+		}
+		atomic.StoreInt32(&state.recoveryMode, 1)
+		changeObfuscationPattern(state, true)
+		atomic.StoreInt32(&state.forceRehandshake, 1)
+	}
+}
+
+func markReceivedTraffic(state *obfuscationState, peer *Peer) {
+	if state != nil {
+		now := time.Now().Unix()
+		lastReceived := atomic.LoadInt64(&state.lastReceived)
+		
+		if now-lastReceived > 5 {
+			peer.device.log.Verbosef("OBF: Received traffic from server (gap: %ds)", now-lastReceived)
+		}
+		
+		atomic.StoreInt64(&state.lastReceived, now)
+		atomic.StoreInt64(&state.lastHandshakeResponse, now)
+		atomic.StoreUint32(&state.handshakeAttempts, 0)
+		atomic.StoreUint32(&state.consecutiveFailedHandshakes, 0)
+		wasStale := atomic.SwapInt32(&state.connectionStale, 0)
+		
+		if wasStale > 0 {
+			peer.device.log.Verbosef("OBF: Connection recovered from stale state")
+		}
+		
+		recoveryMode := atomic.LoadInt32(&state.recoveryMode)
+		if recoveryMode > 0 {
+			total := atomic.LoadUint32(&state.totalCount)
+			successCount := atomic.LoadUint32(&state.successCount)
+			if total > 100 {
+				ratio := float64(successCount) / float64(total)
+				if ratio > 0.95 {
+					peer.device.log.Verbosef("OBF: Exiting recovery mode - connection stable (%.1f%% success)", ratio*100)
+					atomic.StoreInt32(&state.recoveryMode, 0)
+					atomic.StoreInt32(&state.randomizedObfuscation, 0)
+					atomic.StoreUint32(&state.recoveryAttempts, 0)
+				}
+			}
+		}
+	}
+}
+
+func changeObfuscationPattern(state *obfuscationState, randomize bool) {
+	now := time.Now().Unix()
+	atomic.StoreInt64(&state.lastPatternChange, now)
+	
+	if randomize || atomic.LoadInt32(&state.randomizedObfuscation) > 0 {
+		variance, _ := crandInt(128, 320)
+		prePackets, _ := crandInt(2, 7)
+		camoFreq, _ := crandInt(4, 8)
+		jitter, _ := crandInt(0, 4)
+		
+		atomic.StoreInt32(&state.paddingVariance, int32(variance))
+		atomic.StoreInt32(&state.prePacketCount, int32(prePackets))
+		atomic.StoreInt32(&state.camouflageFreq, int32(camoFreq))
+		atomic.StoreInt32(&state.timeJitter, int32(jitter))
+		
+		atomic.AddInt32(&state.activePattern, 1)
+	} else {
+		pattern := atomic.AddInt32(&state.activePattern, 1) % 4
+		
+		switch pattern {
+		case 0:
+			atomic.StoreInt32(&state.paddingVariance, 160)
+			atomic.StoreInt32(&state.prePacketCount, 3)
+			atomic.StoreInt32(&state.camouflageFreq, 6)
+			atomic.StoreInt32(&state.timeJitter, 1)
+		case 1:
+			atomic.StoreInt32(&state.paddingVariance, 256)
+			atomic.StoreInt32(&state.prePacketCount, 4)
+			atomic.StoreInt32(&state.camouflageFreq, 5)
+			atomic.StoreInt32(&state.timeJitter, 2)
+		case 2:
+			atomic.StoreInt32(&state.paddingVariance, 192)
+			atomic.StoreInt32(&state.prePacketCount, 2)
+			atomic.StoreInt32(&state.camouflageFreq, 7)
+			atomic.StoreInt32(&state.timeJitter, 1)
+		case 3:
+			atomic.StoreInt32(&state.paddingVariance, 224)
+			atomic.StoreInt32(&state.prePacketCount, 5)
+			atomic.StoreInt32(&state.camouflageFreq, 4)
+			atomic.StoreInt32(&state.timeJitter, 3)
+		}
+	}
+	
+	rotateProfile(state)
+}
+
+func updateStats(state *obfuscationState, success bool, peer *Peer) {
+	total := atomic.AddUint32(&state.totalCount, 1)
+	
+	if success {
+		atomic.AddUint32(&state.successCount, 1)
+		atomic.StoreUint32(&state.failureStreak, 0)
+		atomic.StoreInt64(&state.lastSuccessfulSend, time.Now().Unix())
+	} else {
+		streak := atomic.AddUint32(&state.failureStreak, 1)
+		
+		if streak >= failureStreakThreshold {
+			peer.device.log.Verbosef("OBF: Failure streak reached %d, triggering recovery", streak)
+			atomic.StoreInt32(&state.recoveryMode, 1)
+			changeObfuscationPattern(state, true)
+			atomic.StoreInt32(&state.forceRehandshake, 1)
+		}
+	}
+	
+	if total%50 == 0 {
+		successCount := atomic.LoadUint32(&state.successCount)
+		ratio := float64(successCount) / float64(total)
+		
+		peer.device.log.Verbosef("OBF: Stats - Success rate: %.1f%% (%d/%d)", ratio*100, successCount, total)
+		
+		if ratio < 0.5 {
+			peer.device.log.Verbosef("OBF: Low success rate detected, entering recovery")
+			atomic.StoreInt32(&state.recoveryMode, 1)
+			changeObfuscationPattern(state, true)
+		}
+	}
+	
+	if total > 1000000 {
+		atomic.StoreUint32(&state.successCount, 0)
+		atomic.StoreUint32(&state.totalCount, 0)
+	}
+}
+
+func shouldRotateProfile(state *obfuscationState) bool {
+	now := time.Now().Unix()
+	lastRotation := atomic.LoadInt64(&state.profileRotation)
+	
+	recoveryMode := atomic.LoadInt32(&state.recoveryMode)
+	interval := profileRotationInterval
+	if recoveryMode > 0 {
+		interval = 45
+	}
+	
+	if now-lastRotation > int64(interval) {
+		atomic.StoreInt64(&state.profileRotation, now)
+		return true
+	}
+	return false
+}
+
+func rotateProfile(state *obfuscationState) {
+	currentProfile := state.sizeProfile
+	var newProfile sizeProfile
+	
+	for {
+		var idx [1]byte
+		rand.Read(idx[:])
+		newProfile = sizeProfiles[int(idx[0])&3]
+		if newProfile != currentProfile {
+			break
+		}
+	}
+	
+	state.sizeProfile = newProfile
+}
+
+func logObfuscationSettings(peer *Peer, state *obfuscationState) {
+	pattern := atomic.LoadInt32(&state.activePattern)
+	variance := atomic.LoadInt32(&state.paddingVariance)
+	prePackets := atomic.LoadInt32(&state.prePacketCount)
+	camouflageFreq := atomic.LoadInt32(&state.camouflageFreq)
+	jitter := atomic.LoadInt32(&state.timeJitter)
+	randomized := atomic.LoadInt32(&state.randomizedObfuscation)
+	
+	if randomized > 0 {
+		peer.device.log.Verbosef("OBF: RANDOMIZED Pattern %d - Profile:%d Variance:%d PrePkts:%d CamoFreq:%d Jitter:%d", 
+			pattern, state.sizeProfile, variance, prePackets, camouflageFreq, jitter)
+	} else {
+		peer.device.log.Verbosef("OBF: Pattern %d activated - Profile:%d Variance:%d PrePkts:%d CamoFreq:%d Jitter:%d", 
+			pattern, state.sizeProfile, variance, prePackets, camouflageFreq, jitter)
+	}
+}
+
+func detectBurstTraffic(state *obfuscationState) bool {
+	now := time.Now().Unix()
+	lastBurst := atomic.LoadInt64(&state.lastBurst)
+	
+	if now-lastBurst > burstWindow {
+		atomic.StoreUint32(&state.burstCounter, 0)
+		atomic.StoreInt64(&state.lastBurst, now)
+	}
+	
+	count := atomic.AddUint32(&state.burstCounter, 1)
+	return count > burstThreshold
+}
+
+func shouldSendCamouflage(peer *Peer) bool {
+	state := getPeerObfuscation(peer)
+	if state == nil {
+		return false
+	}
+	
+	now := time.Now().Unix()
+	lastTraffic := atomic.LoadInt64(&state.lastRealTraffic)
+	
+	recoveryMode := atomic.LoadInt32(&state.recoveryMode)
+	timeout := int64(45)
+	if recoveryMode > 0 {
+		timeout = 30
+	}
+	
+	if now-lastTraffic > timeout {
+		return false
+	}
+	
+	if detectBurstTraffic(state) {
+		return false
+	}
+	
+	counter := atomic.AddUint32(&state.coinCounter, 1)
+	freq := atomic.LoadInt32(&state.camouflageFreq)
+	mask := uint32((1 << freq) - 1)
+	
+	return (counter & mask) == 0
+}
+
+func sendCamouflagePacket(peer *Peer) {
+	state := getPeerObfuscation(peer)
+	if state == nil {
+		return
+	}
+	
+	targetSize := int(state.sizeProfile)
+	variance, _ := crandInt(-96, 96)
+	targetSize += variance
+	
+	if targetSize < coverSizeMin {
+		targetSize = coverSizeMin
+	}
+	if targetSize > 1420 {
+		targetSize = 1420
+	}
+	
+	b := make([]byte, targetSize)
+	rand.Read(b)
+	
+	peer.SendBuffers([][]byte{b})
+}
+
+func crandInt(min, max int) (int, error) {
+	if max <= min {
+		return min, nil
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(max-min+1)))
+	if err != nil {
+		return 0, err
+	}
+	return min + int(n.Int64()), nil
+}
+
+func crandIntUnsafe(min, max int) int {
+	v, _ := crandInt(min, max)
+	return v
+}
+
+func sendHandshakePrePackets(peer *Peer) {
+	state := getPeerObfuscation(peer)
+	if state == nil {
+		return
+	}
+	
+	randomized := atomic.LoadInt32(&state.randomizedObfuscation)
+	
+	var numPackets int
+	var minDelay, maxDelay int
+	var minSize, maxSize int
+	
+	if randomized > 0 {
+		numPackets = crandIntUnsafe(3, 8)
+		minDelay = crandIntUnsafe(1, 5)
+		maxDelay = crandIntUnsafe(5, 15)
+		minSize = crandIntUnsafe(coverSizeMin, coverSizeMin+20)
+		maxSize = crandIntUnsafe(coverSizeMax-10, coverSizeMax+20)
+		
+		peer.device.log.Verbosef("OBF: Sending %d RANDOMIZED pre-handshake packets (delay %d-%dms, size %d-%d)", 
+			numPackets, minDelay, maxDelay, minSize, maxSize)
+	} else {
+		numPackets = int(atomic.LoadInt32(&state.prePacketCount))
+		variance := crandIntUnsafe(-1, 1)
+		numPackets += variance
+		if numPackets < 2 {
+			numPackets = 2
+		}
+		if numPackets > 6 {
+			numPackets = 6
+		}
+		minSize = coverSizeMin
+		maxSize = coverSizeMax
+		minDelay = 1
+		jitter := atomic.LoadInt32(&state.timeJitter)
+		maxDelay = 3 + int(jitter)*2
+		
+		peer.device.log.Verbosef("OBF: Sending %d pre-handshake packets", numPackets)
+	}
+	
+	for i := 0; i < numPackets; i++ {
+		sz := crandIntUnsafe(minSize, maxSize)
+		if sz > 0 {
+			b := make([]byte, sz)
+			rand.Read(b)
+			peer.SendBuffers([][]byte{b})
+		}
+		
+		if i < numPackets-1 {
+			delay := crandIntUnsafe(minDelay, maxDelay)
+			if delay > 0 {
+				time.Sleep(time.Duration(delay) * time.Millisecond)
+			}
+		}
+	}
+}
+
+func padToProfileSmart(pkt []byte, state *obfuscationState, maxSize int, peer *Peer) []byte {
+	targetSize := int(state.sizeProfile)
+	
+	variance := int(atomic.LoadInt32(&state.paddingVariance))
+	vrand, _ := crandInt(-variance, variance)
+	targetSize += vrand
+	
+	if targetSize > maxSize {
+		targetSize = maxSize
+	}
+	
+	currentSize := len(pkt)
+	if currentSize >= targetSize {
+		return pkt
+	}
+	
+	paddingSize := targetSize - currentSize
+	
+	if cap(pkt) >= targetSize {
+		pkt = pkt[:targetSize]
+		for i := currentSize; i < targetSize; i++ {
+			pkt[i] = 0
+		}
+		return pkt
+	}
+	
+	return append(pkt, make([]byte, paddingSize)...)
+}
+
+func onesComplementSum(data []byte) uint32 {
+	var sum uint32
+	for len(data) >= 2 {
+		sum += uint32(binary.BigEndian.Uint16(data[:2]))
+		data = data[2:]
+	}
+	if len(data) == 1 {
+		sum += uint32(uint16(data[0]) << 8)
+	}
+	return sum
+}
+
+func finalizeChecksum(sum uint32) uint16 {
+	for (sum >> 16) != 0 {
+		sum = (sum & 0xFFFF) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+func clampTCPMSSv4(pkt []byte, tunMTU int) bool {
+	if len(pkt) < ipv4.HeaderLen {
+		return false
+	}
+	ihl := int((pkt[0] & 0x0F) << 2)
+	if ihl < ipv4.HeaderLen || len(pkt) < ihl+20 {
+		return false
+	}
+	if pkt[9] != 6 {
+		return false
+	}
+	totalLen := int(binary.BigEndian.Uint16(pkt[2:4]))
+	if totalLen == 0 || totalLen > len(pkt) {
+		totalLen = len(pkt)
+	}
+	ipHdr := pkt[:ihl]
+	tcp := pkt[ihl:totalLen]
+	if len(tcp) < 20 {
+		return false
+	}
+	dataOffset := int((tcp[12] >> 4) * 4)
+	if dataOffset < 20 || len(tcp) < dataOffset {
+		return false
+	}
+	if (tcp[13] & 0x02) == 0 {
+		return false
+	}
+	targetMSS := tunMTU - 40
+	if targetMSS < 536 {
+		targetMSS = 536
+	}
+	opts := tcp[20:dataOffset]
+	changed := false
+	i := 0
+	for i < len(opts) {
+		kind := opts[i]
+		if kind == 0 {
+			break
+		}
+		if kind == 1 {
+			i++
+			continue
+		}
+		if i+1 >= len(opts) {
+			break
+		}
+		optLen := int(opts[i+1])
+		if optLen < 2 || i+optLen > len(opts) {
+			break
+		}
+		if kind == 2 && optLen == 4 {
+			currentMSS := binary.BigEndian.Uint16(opts[i+2 : i+4])
+			if int(currentMSS) > targetMSS {
+				binary.BigEndian.PutUint16(opts[i+2:i+4], uint16(targetMSS))
+				changed = true
+			}
+			break
+		}
+		i += optLen
+	}
+	if !changed {
+		return false
+	}
+	tcp[16] = 0
+	tcp[17] = 0
+	srcIP := ipHdr[12:16]
+	dstIP := ipHdr[16:20]
+	tcpLen := uint16(len(tcp))
+	var sum uint32
+	pseudoHeader := make([]byte, 12)
+	copy(pseudoHeader[0:4], srcIP)
+	copy(pseudoHeader[4:8], dstIP)
+	pseudoHeader[8] = 0
+	pseudoHeader[9] = 6
+	binary.BigEndian.PutUint16(pseudoHeader[10:12], tcpLen)
+	sum += onesComplementSum(pseudoHeader)
+	sum += onesComplementSum(tcp)
+	checksum := finalizeChecksum(sum)
+	binary.BigEndian.PutUint16(tcp[16:18], checksum)
+	return true
+}
+
+func clampTCPMSSv6(pkt []byte, tunMTU int) bool {
+	if len(pkt) < 60 || pkt[6] != 6 {
+		return false
+	}
+	tcp := pkt[40:]
+	if len(tcp) < 20 {
+		return false
+	}
+	dataOffset := int((tcp[12] >> 4) * 4)
+	if dataOffset < 20 || len(tcp) < dataOffset {
+		return false
+	}
+	if tcp[13]&0x02 == 0 {
+		return false
+	}
+	targetMSS := tunMTU - 60
+	if targetMSS < 1220 {
+		targetMSS = 1220
+	}
+	opts := tcp[20:dataOffset]
+	changed := false
+	i := 0
+	for i < len(opts) {
+		kind := opts[i]
+		if kind == 0 {
+			break
+		}
+		if kind == 1 {
+			i++
+			continue
+		}
+		if i+1 >= len(opts) {
+			break
+		}
+		optLen := int(opts[i+1])
+		if optLen < 2 || i+optLen > len(opts) {
+			break
+		}
+		if kind == 2 && optLen == 4 {
+			currentMSS := binary.BigEndian.Uint16(opts[i+2 : i+4])
+			if int(currentMSS) > targetMSS {
+				binary.BigEndian.PutUint16(opts[i+2:i+4], uint16(targetMSS))
+				changed = true
+			}
+			break
+		}
+		i += optLen
+	}
+	if !changed {
+		return false
+	}
+	tcp[16] = 0
+	tcp[17] = 0
+	var sum uint32
+	for i := 8; i < 40; i += 2 {
+		sum += uint32(pkt[i])<<8 | uint32(pkt[i+1])
+	}
+	sum += uint32(len(tcp))
+	sum += 6
+	for i := 0; i+1 < len(tcp); i += 2 {
+		sum += uint32(tcp[i])<<8 | uint32(tcp[i+1])
+	}
+	if len(tcp)&1 != 0 {
+		sum += uint32(tcp[len(tcp)-1]) << 8
+	}
+	for sum > 0xFFFF {
+		sum = (sum & 0xFFFF) + (sum >> 16)
+	}
+	binary.BigEndian.PutUint16(tcp[16:], ^uint16(sum))
+	return true
+}
+
 func (device *Device) NewOutboundElement() *QueueOutboundElement {
 	elem := device.GetOutboundElement()
 	elem.buffer = device.GetMessageBuffer()
 	elem.nonce = 0
-	// keypair and peer were cleared (if necessary) by clearPointers.
 	return elem
 }
 
-// clearPointers clears elem fields that contain pointers.
-// This makes the garbage collector's life easier and
-// avoids accidentally keeping other objects around unnecessarily.
-// It also reduces the possible collateral damage from use-after-free bugs.
 func (elem *QueueOutboundElement) clearPointers() {
 	elem.buffer = nil
 	elem.packet = nil
@@ -76,8 +822,6 @@ func (elem *QueueOutboundElement) clearPointers() {
 	elem.peer = nil
 }
 
-/* Queues a keepalive if no packets are queued for peer
- */
 func (peer *Peer) SendKeepalive() {
 	if len(peer.queue.staged) == 0 && peer.isRunning.Load() {
 		elem := peer.device.NewOutboundElement()
@@ -99,14 +843,12 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	if !isRetry {
 		peer.timers.handshakeAttempts.Store(0)
 	}
-
 	peer.handshake.mutex.RLock()
 	if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
 		peer.handshake.mutex.RUnlock()
 		return nil
 	}
 	peer.handshake.mutex.RUnlock()
-
 	peer.handshake.mutex.Lock()
 	if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
 		peer.handshake.mutex.Unlock()
@@ -114,28 +856,60 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	}
 	peer.handshake.lastSentHandshake = time.Now()
 	peer.handshake.mutex.Unlock()
-
 	peer.device.log.Verbosef("%v - Sending handshake initiation", peer)
-
+	
+	state := getPeerObfuscation(peer)
+	if state != nil {
+		atomic.StoreInt64(&state.lastHandshake, time.Now().Unix())
+		logObfuscationSettings(peer, state)
+		
+		randomized := atomic.LoadInt32(&state.randomizedObfuscation)
+		if randomized > 0 {
+			delay := crandIntUnsafe(0, 20)
+			if delay > 0 {
+				peer.device.log.Verbosef("OBF: Applying RANDOM handshake jitter: %dms", delay)
+				time.Sleep(time.Duration(delay) * time.Millisecond)
+			}
+		} else {
+			jitter := atomic.LoadInt32(&state.timeJitter)
+			if jitter > 0 {
+				delay, _ := crandInt(0, 5+int(jitter)*3)
+				if delay > 0 {
+					peer.device.log.Verbosef("OBF: Applying handshake jitter: %dms", delay)
+					time.Sleep(time.Duration(delay) * time.Millisecond)
+				}
+			}
+		}
+	}
+	
+	sendHandshakePrePackets(peer)
+	
 	msg, err := peer.device.CreateMessageInitiation(peer)
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to create initiation message: %v", peer, err)
+		if state != nil {
+			updateStats(state, false, peer)
+		}
 		return err
 	}
-
 	packet := make([]byte, MessageInitiationSize)
 	_ = msg.marshal(packet)
 	peer.cookieGenerator.AddMacs(packet)
-
 	peer.timersAnyAuthenticatedPacketTraversal()
 	peer.timersAnyAuthenticatedPacketSent()
-
 	err = peer.SendBuffers([][]byte{packet})
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to send handshake initiation: %v", peer, err)
+		if state != nil {
+			updateStats(state, false, peer)
+		}
+	} else {
+		peer.device.log.Verbosef("OBF: Handshake initiation sent successfully")
+		if state != nil {
+			updateStats(state, true, peer)
+		}
 	}
 	peer.timersHandshakeInitiated()
-
 	return err
 }
 
@@ -143,30 +917,30 @@ func (peer *Peer) SendHandshakeResponse() error {
 	peer.handshake.mutex.Lock()
 	peer.handshake.lastSentHandshake = time.Now()
 	peer.handshake.mutex.Unlock()
-
 	peer.device.log.Verbosef("%v - Sending handshake response", peer)
-
+	
+	state := getPeerObfuscation(peer)
+	if state != nil {
+		markReceivedTraffic(state, peer)
+		atomic.StoreInt64(&state.lastHandshake, time.Now().Unix())
+	}
+	
 	response, err := peer.device.CreateMessageResponse(peer)
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to create response message: %v", peer, err)
 		return err
 	}
-
 	packet := make([]byte, MessageResponseSize)
 	_ = response.marshal(packet)
 	peer.cookieGenerator.AddMacs(packet)
-
 	err = peer.BeginSymmetricSession()
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to derive keypair: %v", peer, err)
 		return err
 	}
-
 	peer.timersSessionDerived()
 	peer.timersAnyAuthenticatedPacketTraversal()
 	peer.timersAnyAuthenticatedPacketSent()
-
-	// TODO: allocation could be avoided
 	err = peer.SendBuffers([][]byte{packet})
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to send handshake response: %v", peer, err)
@@ -176,19 +950,15 @@ func (peer *Peer) SendHandshakeResponse() error {
 
 func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement) error {
 	device.log.Verbosef("Sending cookie response for denied handshake message for %v", initiatingElem.endpoint.DstToString())
-
 	sender := binary.LittleEndian.Uint32(initiatingElem.packet[4:8])
 	reply, err := device.cookieChecker.CreateReply(initiatingElem.packet, sender, initiatingElem.endpoint.DstToBytes())
 	if err != nil {
 		device.log.Errorf("Failed to create cookie reply: %v", err)
 		return err
 	}
-
 	packet := make([]byte, MessageCookieReplySize)
 	_ = reply.marshal(packet)
-	// TODO: allocation could be avoided
 	device.net.bind.Send([][]byte{packet}, initiatingElem.endpoint)
-
 	return nil
 }
 
@@ -209,9 +979,7 @@ func (device *Device) RoutineReadFromTUN() {
 		device.state.stopping.Done()
 		device.queue.encryption.wg.Done()
 	}()
-
 	device.log.Verbosef("Routine: TUN reader - started")
-
 	var (
 		batchSize   = device.BatchSize()
 		readErr     error
@@ -222,12 +990,10 @@ func (device *Device) RoutineReadFromTUN() {
 		sizes       = make([]int, batchSize)
 		offset      = MessageTransportHeaderSize
 	)
-
 	for i := range elems {
 		elems[i] = device.NewOutboundElement()
 		bufs[i] = elems[i].buffer[:]
 	}
-
 	defer func() {
 		for _, elem := range elems {
 			if elem != nil {
@@ -236,19 +1002,23 @@ func (device *Device) RoutineReadFromTUN() {
 			}
 		}
 	}()
-
+	tunMTU := int(device.tun.mtu.Load())
 	for {
-		// read packets
 		count, readErr = device.tun.device.Read(bufs, sizes, offset)
 		for i := 0; i < count; i++ {
 			if sizes[i] < 1 {
 				continue
 			}
-
 			elem := elems[i]
 			elem.packet = bufs[i][offset : offset+sizes[i]]
-
-			// lookup peer
+			if len(elem.packet) >= 40 {
+				ipVersion := elem.packet[0] >> 4
+				if ipVersion == 4 {
+					clampTCPMSSv4(elem.packet, tunMTU)
+				} else if ipVersion == 6 && len(elem.packet) >= 60 {
+					clampTCPMSSv6(elem.packet, tunMTU)
+				}
+			}
 			var peer *Peer
 			switch elem.packet[0] >> 4 {
 			case 4:
@@ -257,21 +1027,28 @@ func (device *Device) RoutineReadFromTUN() {
 				}
 				dst := elem.packet[IPv4offsetDst : IPv4offsetDst+net.IPv4len]
 				peer = device.allowedips.Lookup(dst)
-
 			case 6:
 				if len(elem.packet) < ipv6.HeaderLen {
 					continue
 				}
 				dst := elem.packet[IPv6offsetDst : IPv6offsetDst+net.IPv6len]
 				peer = device.allowedips.Lookup(dst)
-
 			default:
 				device.log.Verbosef("Received packet with unknown IP version")
 			}
-
 			if peer == nil {
 				continue
 			}
+			state := initPeerObfuscation(peer)
+			atomic.StoreInt64(&state.lastRealTraffic, time.Now().Unix())
+			
+			checkTrafficHealth(peer, state)
+			
+			if shouldRotateProfile(state) {
+				rotateProfile(state)
+				device.log.Verbosef("OBF: Rotated size profile to %d", state.sizeProfile)
+			}
+			
 			elemsForPeer, ok := elemsByPeer[peer]
 			if !ok {
 				elemsForPeer = device.GetOutboundElementsContainer()
@@ -281,11 +1058,13 @@ func (device *Device) RoutineReadFromTUN() {
 			elems[i] = device.NewOutboundElement()
 			bufs[i] = elems[i].buffer[:]
 		}
-
 		for peer, elemsForPeer := range elemsByPeer {
 			if peer.isRunning.Load() {
 				peer.StagePackets(elemsForPeer)
 				peer.SendStagedPackets()
+				if shouldSendCamouflage(peer) {
+					go sendCamouflagePacket(peer)
+				}
 			} else {
 				for _, elem := range elemsForPeer.elems {
 					device.PutMessageBuffer(elem.buffer)
@@ -295,12 +1074,8 @@ func (device *Device) RoutineReadFromTUN() {
 			}
 			delete(elemsByPeer, peer)
 		}
-
 		if readErr != nil {
 			if errors.Is(readErr, tun.ErrTooManySegments) {
-				// TODO: record stat for this
-				// This will happen if MSS is surprisingly small (< 576)
-				// coincident with reasonably high throughput.
 				device.log.Verbosef("Dropped some packets from multi-segment read: %v", readErr)
 				continue
 			}
@@ -339,13 +1114,11 @@ top:
 	if len(peer.queue.staged) == 0 || !peer.device.isUp() {
 		return
 	}
-
 	keypair := peer.keypairs.Current()
 	if keypair == nil || keypair.sendNonce.Load() >= RejectAfterMessages || time.Since(keypair.created) >= RejectAfterTime {
 		peer.SendHandshakeInitiation(false)
 		return
 	}
-
 	for {
 		var elemsContainerOOO *QueueOutboundElementsContainer
 		select {
@@ -365,22 +1138,17 @@ top:
 					elemsContainer.elems[i] = elem
 					i++
 				}
-
 				elem.keypair = keypair
 			}
 			elemsContainer.Lock()
 			elemsContainer.elems = elemsContainer.elems[:i]
-
 			if elemsContainerOOO != nil {
-				peer.StagePackets(elemsContainerOOO) // XXX: Out of order, but we can't front-load go chans
+				peer.StagePackets(elemsContainerOOO)
 			}
-
 			if len(elemsContainer.elems) == 0 {
 				peer.device.PutOutboundElementsContainer(elemsContainer)
 				goto top
 			}
-
-			// add to parallel and sequential queue
 			if peer.isRunning.Load() {
 				peer.queue.outbound.c <- elemsContainer
 				peer.device.queue.encryption.c <- elemsContainer
@@ -391,7 +1159,6 @@ top:
 				}
 				peer.device.PutOutboundElementsContainer(elemsContainer)
 			}
-
 			if elemsContainerOOO != nil {
 				goto top
 			}
@@ -431,44 +1198,31 @@ func calculatePaddingSize(packetSize, mtu int) int {
 	return paddedSize - lastUnit
 }
 
-/* Encrypts the elements in the queue
- * and marks them for sequential consumption (by releasing the mutex)
- *
- * Obs. One instance per core
- */
 func (device *Device) RoutineEncryption(id int) {
 	var paddingZeros [PaddingMultiple]byte
 	var nonce [chacha20poly1305.NonceSize]byte
-
 	defer device.log.Verbosef("Routine: encryption worker %d - stopped", id)
 	device.log.Verbosef("Routine: encryption worker %d - started", id)
-
 	for elemsContainer := range device.queue.encryption.c {
 		for _, elem := range elemsContainer.elems {
-			// populate header fields
 			header := elem.buffer[:MessageTransportHeaderSize]
-
 			fieldType := header[0:4]
 			fieldReceiver := header[4:8]
 			fieldNonce := header[8:16]
-
 			binary.LittleEndian.PutUint32(fieldType, MessageTransportType)
 			binary.LittleEndian.PutUint32(fieldReceiver, elem.keypair.remoteIndex)
 			binary.LittleEndian.PutUint64(fieldNonce, elem.nonce)
-
-			// pad content to multiple of 16
 			paddingSize := calculatePaddingSize(len(elem.packet), int(device.tun.mtu.Load()))
 			elem.packet = append(elem.packet, paddingZeros[:paddingSize]...)
-
-			// encrypt content and release to consumer
-
+			if elem.peer != nil {
+				if state := getPeerObfuscation(elem.peer); state != nil {
+					tunMTU := int(device.tun.mtu.Load())
+					maxSafeSize := tunMTU - MessageTransportHeaderSize - chacha20poly1305.Overhead
+					elem.packet = padToProfileSmart(elem.packet, state, maxSafeSize, elem.peer)
+				}
+			}
 			binary.LittleEndian.PutUint64(nonce[4:], elem.nonce)
-			elem.packet = elem.keypair.send.Seal(
-				header,
-				nonce[:],
-				elem.packet,
-				nil,
-			)
+			elem.packet = elem.keypair.send.Seal(header, nonce[:], elem.packet, nil)
 		}
 		elemsContainer.Unlock()
 	}
@@ -479,23 +1233,16 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 	defer func() {
 		defer device.log.Verbosef("%v - Routine: sequential sender - stopped", peer)
 		peer.stopping.Done()
+		cleanupPeerObfuscation(peer)
 	}()
 	device.log.Verbosef("%v - Routine: sequential sender - started", peer)
-
 	bufs := make([][]byte, 0, maxBatchSize)
-
 	for elemsContainer := range peer.queue.outbound.c {
 		bufs = bufs[:0]
 		if elemsContainer == nil {
 			return
 		}
 		if !peer.isRunning.Load() {
-			// peer has been stopped; return re-usable elems to the shared pool.
-			// This is an optimization only. It is possible for the peer to be stopped
-			// immediately after this check, in which case, elem will get processed.
-			// The timers and SendBuffers code are resilient to a few stragglers.
-			// TODO: rework peer shutdown order to ensure
-			// that we never accidentally keep timers alive longer than necessary.
 			elemsContainer.Lock()
 			for _, elem := range elemsContainer.elems {
 				device.PutMessageBuffer(elem.buffer)
@@ -512,11 +1259,19 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 			}
 			bufs = append(bufs, elem.packet)
 		}
-
 		peer.timersAnyAuthenticatedPacketTraversal()
 		peer.timersAnyAuthenticatedPacketSent()
-
 		err := peer.SendBuffers(bufs)
+		
+		state := getPeerObfuscation(peer)
+		if state != nil {
+			if err != nil {
+				updateStats(state, false, peer)
+			} else {
+				updateStats(state, true, peer)
+			}
+		}
+		
 		if dataSent {
 			peer.timersDataSent()
 		}
@@ -536,7 +1291,6 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 			device.log.Errorf("%v - Failed to send data packets: %v", peer, err)
 			continue
 		}
-
 		peer.keepKeyFreshSending()
 	}
 }
