@@ -1,10 +1,10 @@
 package device
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
-	"math/big"
 	"net"
 	"os"
 	"sync"
@@ -18,6 +18,10 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 )
 
+// ---------------------------------------------------------------------------
+// Obfuscation types and constants
+// ---------------------------------------------------------------------------
+
 type sizeProfile int
 
 const (
@@ -30,36 +34,43 @@ const (
 var sizeProfiles = [4]sizeProfile{profileSmall, profileMedium, profileLarge, profileJumbo}
 
 type obfuscationState struct {
-	sizeProfile              sizeProfile
-	lastRealTraffic          int64
-	lastSuccessfulSend       int64
-	lastPatternChange        int64
-	lastKeepalive            int64
-	lastReceived             int64
-	lastHandshake            int64
-	lastHandshakeResponse    int64
-	lastRecoveryAttempt      int64
-	coinCounter              uint32
-	successCount             uint32
-	totalCount               uint32
-	failureStreak            uint32
-	profileRotation          int64
-	burstCounter             uint32
-	lastBurst                int64
-	timeJitter               int32
-	paddingVariance          int32
-	prePacketCount           int32
-	camouflageFreq           int32
-	lastHealthCheck          int64
-	activePattern            int32
-	recoveryMode             int32
-	connectionStale          int32
-	forceRehandshake         int32
-	recoveryAttempts         uint32
-	handshakeAttempts        uint32
+	sizeProfile                 sizeProfile
+	lastRealTraffic             int64
+	lastSuccessfulSend          int64
+	lastPatternChange           int64
+	lastKeepalive               int64
+	lastReceived                int64
+	lastHandshake               int64
+	lastHandshakeResponse       int64
+	lastRecoveryAttempt         int64
+	coinCounter                 uint32
+	successCount                uint32
+	totalCount                  uint32
+	failureStreak               uint32
+	profileRotation             int64
+	burstCounter                uint32
+	lastBurst                   int64
+	timeJitter                  int32
+	paddingVariance             int32
+	prePacketCount              int32
+	camouflageFreq              int32
+	lastHealthCheck             int64
+	activePattern               int32
+	recoveryMode                int32
+	connectionStale             int32
+	forceRehandshake            int32
+	recoveryAttempts            uint32
+	handshakeAttempts           uint32
 	consecutiveFailedHandshakes uint32
-	randomizedObfuscation    int32
+	randomizedObfuscation       int32
+	recoveryStartTime           int64  // when recovery mode was entered
+	lastRehandshakeBackoff      int64  // tracks backoff for forced rehandshakes
+	rehandshakeBackoffSecs      int32  // current backoff duration in seconds
 }
+
+// ---------------------------------------------------------------------------
+// Core WireGuard types
+// ---------------------------------------------------------------------------
 
 type QueueOutboundElement struct {
 	buffer  *[MaxMessageSize]byte
@@ -74,106 +85,123 @@ type QueueOutboundElementsContainer struct {
 	elems []*QueueOutboundElement
 }
 
+// ---------------------------------------------------------------------------
+// Obfuscation constants — tuned for stability
+// ---------------------------------------------------------------------------
+
 const (
-	coverSizeMin                = 16
-	coverSizeMax                = 64
-	profileRotationInterval     = 120
-	burstWindow                 = 3
-	burstThreshold              = 15
-	healthCheckInterval         = 2
-	trafficTimeoutNormal        = 15
-	trafficTimeoutRecovery      = 8
-	patternChangeInterval       = 300
-	failureStreakThreshold      = 3
-	keepaliveInterval           = 8
-	idleTimeout                 = 60
-	staleConnectionTimeout      = 25
-	probeInterval               = 5
-	handshakeTimeout            = 35
-	handshakeResponseTimeout    = 10
-	recoveryCheckInterval       = 1
-	maxRecoveryAttempts         = 3
-	forceRehandshakeInterval    = 30
-	aggressiveRecoveryInterval  = 20
-	handshakeBlockedThreshold   = 5
+	coverSizeMin               = 16
+	coverSizeMax               = 64
+	profileRotationInterval    = 120
+	burstWindow                = 3
+	burstThreshold             = 15
+	trafficTimeoutNormal       = 15
+	trafficTimeoutRecovery     = 8
+	failureStreakThreshold     = 5  // raised from 3 to reduce false recovery triggers
+	obfKeepaliveInterval       = 8
+	idleTimeout                = 60
+	staleConnectionTimeout     = 45 // raised from 25 to allow more time before declaring stale
+	probeInterval              = 5
+	handshakeTimeout           = 35
+	handshakeResponseTimeout   = 10
+	recoveryCheckInterval      = 2  // raised from 1 to reduce CPU usage
+	maxRecoveryAttempts        = 5  // raised from 3 for more chances
+	aggressiveRecoveryInterval = 30 // raised from 20 to reduce churn
+	handshakeBlockedThreshold  = 5
+	minPatternChangeInterval   = 30 // minimum seconds between pattern changes
+	maxRecoveryDuration        = 300 // 5 minutes max in recovery mode
+	initialRehandshakeBackoff  = 5  // start at 5 seconds
+	maxRehandshakeBackoff      = 60 // cap at 60 seconds
 )
 
-var (
-	peerObfuscation   = make(map[*Peer]*obfuscationState)
-	peerObfuscationMu sync.RWMutex
-)
+// ---------------------------------------------------------------------------
+// Fast non-cryptographic randomness (uses WireGuard's existing fastrandn)
+// ---------------------------------------------------------------------------
 
-func getPeerObfuscation(peer *Peer) *obfuscationState {
-	peerObfuscationMu.RLock()
-	state := peerObfuscation[peer]
-	peerObfuscationMu.RUnlock()
-	return state
+// fastRandRange returns a random int in [min, max] using fastrandn.
+// NOT cryptographically secure — suitable for padding, timing jitter, etc.
+func fastRandRange(min, max int) int {
+	if max <= min {
+		return min
+	}
+	return min + int(fastrandn(uint32(max-min+1)))
 }
 
-func initPeerObfuscation(peer *Peer) *obfuscationState {
-	peerObfuscationMu.Lock()
-	defer peerObfuscationMu.Unlock()
+// crandBytes fills b with cryptographically secure random bytes.
+// Used only for camouflage packet content where randomness quality matters.
+func crandBytes(b []byte) {
+	rand.Read(b)
+}
 
-	if state, ok := peerObfuscation[peer]; ok {
+// ---------------------------------------------------------------------------
+// Peer-local obfuscation state management (replaces global map)
+// ---------------------------------------------------------------------------
+
+func ensurePeerObfuscation(peer *Peer) *obfuscationState {
+	if state := peer.obfState.Load(); state != nil {
 		return state
 	}
 
-	state := &obfuscationState{}
-	var profileIndex [1]byte
-	rand.Read(profileIndex[:])
-	state.sizeProfile = sizeProfiles[int(profileIndex[0])&3]
-	now := time.Now().Unix()
-	state.lastRealTraffic = now
-	state.lastSuccessfulSend = now
-	state.lastPatternChange = now
-	state.lastKeepalive = now
-	state.lastReceived = now
-	state.lastHandshake = now
-	state.lastHandshakeResponse = now
-	state.lastRecoveryAttempt = now
-	state.profileRotation = now
-	state.lastHealthCheck = now
-	state.timeJitter = 1
-	state.paddingVariance = 160
-	state.prePacketCount = 3
-	state.camouflageFreq = 6
-	state.activePattern = 0
-	state.recoveryMode = 0
-	state.connectionStale = 0
-	state.forceRehandshake = 0
-	state.recoveryAttempts = 0
-	state.handshakeAttempts = 0
-	state.consecutiveFailedHandshakes = 0
-	state.randomizedObfuscation = 1
-	peerObfuscation[peer] = state
-	
-	peer.device.log.Verbosef("OBF: Initialized obfuscation for peer %v - Profile: %d, Pattern: 0, RANDOMIZED MODE", peer, state.sizeProfile)
-	
-	go monitorConnectionHealth(peer, state)
-	
-	return state
+	// Use sync.Once to ensure exactly one initialization per peer lifecycle
+	peer.obfInitOnce.Do(func() {
+		state := &obfuscationState{}
+		state.sizeProfile = sizeProfiles[fastrandn(4)]
+		now := time.Now().Unix()
+		state.lastRealTraffic = now
+		state.lastSuccessfulSend = now
+		state.lastPatternChange = now
+		state.lastKeepalive = now
+		state.lastReceived = now
+		state.lastHandshake = now
+		state.lastHandshakeResponse = now
+		state.lastRecoveryAttempt = now
+		state.profileRotation = now
+		state.lastHealthCheck = now
+		state.timeJitter = 1
+		state.paddingVariance = 160
+		state.prePacketCount = 3
+		state.camouflageFreq = 6
+		state.rehandshakeBackoffSecs = initialRehandshakeBackoff
+
+		peer.obfState.Store(state)
+
+		peer.device.log.Verbosef("OBF: Initialized obfuscation for peer %v - Profile: %d, RANDOMIZED MODE", peer, state.sizeProfile)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		peer.obfCancel = cancel
+		go monitorConnectionHealth(ctx, peer, state)
+	})
+
+	return peer.obfState.Load()
 }
 
-func cleanupPeerObfuscation(peer *Peer) {
-	peerObfuscationMu.Lock()
-	delete(peerObfuscation, peer)
-	peerObfuscationMu.Unlock()
+func getPeerObfuscation(peer *Peer) *obfuscationState {
+	return peer.obfState.Load()
 }
 
-func monitorConnectionHealth(peer *Peer, state *obfuscationState) {
+// ---------------------------------------------------------------------------
+// Connection health monitor (runs as a goroutine per peer)
+// ---------------------------------------------------------------------------
+
+func monitorConnectionHealth(ctx context.Context, peer *Peer, state *obfuscationState) {
 	ticker := time.NewTicker(time.Duration(recoveryCheckInterval) * time.Second)
 	defer ticker.Stop()
-	
+
 	peer.device.log.Verbosef("OBF: Started connection monitor for peer %v", peer)
-	
+
 	for {
+		select {
+		case <-ctx.Done():
+			peer.device.log.Verbosef("OBF: Stopping connection monitor for peer %v (context cancelled)", peer)
+			return
+		case <-ticker.C:
+		}
+
 		if !peer.isRunning.Load() {
 			peer.device.log.Verbosef("OBF: Stopping connection monitor for peer %v", peer)
 			return
 		}
-		
-		<-ticker.C
-		
+
 		now := time.Now().Unix()
 		lastReceived := atomic.LoadInt64(&state.lastReceived)
 		lastHandshake := atomic.LoadInt64(&state.lastHandshake)
@@ -181,21 +209,33 @@ func monitorConnectionHealth(peer *Peer, state *obfuscationState) {
 		lastSuccess := atomic.LoadInt64(&state.lastSuccessfulSend)
 		lastRecovery := atomic.LoadInt64(&state.lastRecoveryAttempt)
 		recoveryMode := atomic.LoadInt32(&state.recoveryMode)
-		
+
 		timeSinceReceived := now - lastReceived
 		timeSinceSuccess := now - lastSuccess
 		timeSinceHandshake := now - lastHandshake
 		timeSinceHandshakeResponse := now - lastHandshakeResponse
-		
+
+		// --- Recovery mode timeout: exit after maxRecoveryDuration ---
+		if recoveryMode > 0 {
+			recoveryStart := atomic.LoadInt64(&state.recoveryStartTime)
+			if recoveryStart > 0 && now-recoveryStart > maxRecoveryDuration {
+				peer.device.log.Verbosef("OBF: Recovery mode timeout after %ds, resetting to normal mode", now-recoveryStart)
+				exitRecoveryMode(state)
+			}
+		}
+
+		// --- Detect handshake blocking ---
 		failedHandshakes := atomic.LoadUint32(&state.consecutiveFailedHandshakes)
 		if failedHandshakes >= handshakeBlockedThreshold {
 			peer.device.log.Verbosef("OBF: HANDSHAKE BLOCKING DETECTED - %d consecutive failures, enabling randomized obfuscation", failedHandshakes)
 			atomic.StoreInt32(&state.randomizedObfuscation, 1)
 			atomic.StoreUint32(&state.consecutiveFailedHandshakes, 0)
-			atomic.StoreInt32(&state.recoveryMode, 1)
-			time.Sleep(time.Duration(crandIntUnsafe(500, 2000)) * time.Millisecond)
+			enterRecoveryMode(state, peer)
+			delay := fastRandRange(500, 2000)
+			time.Sleep(time.Duration(delay) * time.Millisecond)
 		}
-		
+
+		// --- Detect handshake timeouts ---
 		if timeSinceHandshake < handshakeResponseTimeout && timeSinceHandshakeResponse > handshakeResponseTimeout && timeSinceHandshake > 5 {
 			attempts := atomic.AddUint32(&state.handshakeAttempts, 1)
 			if attempts > 3 {
@@ -207,61 +247,81 @@ func monitorConnectionHealth(peer *Peer, state *obfuscationState) {
 				}
 			}
 		}
-		
+
+		// --- Detect stale connection ---
 		if timeSinceReceived > staleConnectionTimeout {
 			if atomic.CompareAndSwapInt32(&state.connectionStale, 0, 1) {
 				peer.device.log.Verbosef("OBF: STALE CONNECTION DETECTED - No RX for %ds, triggering recovery", timeSinceReceived)
-				atomic.StoreInt32(&state.recoveryMode, 1)
+				enterRecoveryMode(state, peer)
 				atomic.StoreInt32(&state.randomizedObfuscation, 1)
 				changeObfuscationPattern(state, true)
-				atomic.StoreInt32(&state.forceRehandshake, 1)
+				requestRehandshake(state, peer, now)
 			}
 		}
-		
+
+		// --- Detect traffic timeout ---
 		if timeSinceSuccess > trafficTimeoutNormal {
 			if recoveryMode == 0 {
 				peer.device.log.Verbosef("OBF: Traffic timeout detected (%ds without successful send), entering recovery mode", timeSinceSuccess)
-				atomic.StoreInt32(&state.recoveryMode, 1)
+				enterRecoveryMode(state, peer)
 				changeObfuscationPattern(state, true)
-				atomic.StoreInt32(&state.forceRehandshake, 1)
+				requestRehandshake(state, peer, now)
 			}
 		}
-		
+
+		// --- Detect handshake timeout ---
 		if timeSinceHandshake > handshakeTimeout {
-			peer.device.log.Verbosef("OBF: Handshake timeout (%ds), forcing rehandshake", timeSinceHandshake)
-			atomic.StoreInt32(&state.forceRehandshake, 1)
+			peer.device.log.Verbosef("OBF: Handshake timeout (%ds), requesting rehandshake", timeSinceHandshake)
+			requestRehandshake(state, peer, now)
 		}
-		
+
+		// --- Aggressive recovery with backoff ---
 		if recoveryMode > 0 && now-lastRecovery > aggressiveRecoveryInterval {
 			attempts := atomic.AddUint32(&state.recoveryAttempts, 1)
 			atomic.StoreInt64(&state.lastRecoveryAttempt, now)
-			
-			peer.device.log.Verbosef("OBF: AGGRESSIVE RECOVERY attempt #%d (RX: %ds ago, TX: %ds ago)", 
+
+			peer.device.log.Verbosef("OBF: AGGRESSIVE RECOVERY attempt #%d (RX: %ds ago, TX: %ds ago)",
 				attempts, timeSinceReceived, timeSinceSuccess)
-			
+
 			changeObfuscationPattern(state, true)
-			atomic.StoreInt32(&state.forceRehandshake, 1)
-			
+			requestRehandshake(state, peer, now)
+
 			if attempts >= maxRecoveryAttempts {
 				peer.device.log.Verbosef("OBF: Maximum recovery attempts reached, switching to full randomization")
 				atomic.StoreInt32(&state.randomizedObfuscation, 1)
 				atomic.StoreUint32(&state.recoveryAttempts, 0)
 			}
 		}
-		
+
+		// --- Execute pending rehandshake with backoff ---
 		if atomic.LoadInt32(&state.forceRehandshake) > 0 {
-			atomic.StoreInt32(&state.forceRehandshake, 0)
-			atomic.StoreInt64(&state.lastHandshake, now)
-			peer.device.log.Verbosef("OBF: Forcing handshake initiation")
-			peer.SendHandshakeInitiation(true)
+			backoff := atomic.LoadInt32(&state.rehandshakeBackoffSecs)
+			lastBackoff := atomic.LoadInt64(&state.lastRehandshakeBackoff)
+			if now-lastBackoff >= int64(backoff) {
+				atomic.StoreInt32(&state.forceRehandshake, 0)
+				atomic.StoreInt64(&state.lastRehandshakeBackoff, now)
+				atomic.StoreInt64(&state.lastHandshake, now)
+
+				// Exponential backoff: double the interval, cap at max
+				newBackoff := backoff * 2
+				if newBackoff > maxRehandshakeBackoff {
+					newBackoff = maxRehandshakeBackoff
+				}
+				atomic.StoreInt32(&state.rehandshakeBackoffSecs, newBackoff)
+
+				peer.device.log.Verbosef("OBF: Forcing handshake initiation (next backoff: %ds)", newBackoff)
+				peer.SendHandshakeInitiation(true)
+			}
 		}
-		
+
+		// --- Keepalive probing ---
 		lastKeepalive := atomic.LoadInt64(&state.lastKeepalive)
-		if now-lastKeepalive > keepaliveInterval {
+		if now-lastKeepalive > obfKeepaliveInterval {
 			atomic.StoreInt64(&state.lastKeepalive, now)
 			peer.SendKeepalive()
 		}
-		
+
+		// --- Idle probing ---
 		lastRealTraffic := atomic.LoadInt64(&state.lastRealTraffic)
 		if now-lastRealTraffic > idleTimeout && now-lastKeepalive > probeInterval {
 			atomic.StoreInt64(&state.lastKeepalive, now)
@@ -270,89 +330,99 @@ func monitorConnectionHealth(peer *Peer, state *obfuscationState) {
 	}
 }
 
-func checkTrafficHealth(peer *Peer, state *obfuscationState) {
-	now := time.Now().Unix()
-	lastCheck := atomic.LoadInt64(&state.lastHealthCheck)
-	
-	if now-lastCheck < healthCheckInterval {
-		return
-	}
-	
-	atomic.StoreInt64(&state.lastHealthCheck, now)
-	
-	lastSuccess := atomic.LoadInt64(&state.lastSuccessfulSend)
-	recoveryMode := atomic.LoadInt32(&state.recoveryMode)
-	
-	timeout := trafficTimeoutNormal
-	if recoveryMode > 0 {
-		timeout = trafficTimeoutRecovery
-	}
-	
-	if now-lastSuccess > int64(timeout) {
-		if recoveryMode == 0 {
-			peer.device.log.Verbosef("OBF: Health check failed - entering recovery mode")
-		}
-		atomic.StoreInt32(&state.recoveryMode, 1)
-		changeObfuscationPattern(state, true)
-		atomic.StoreInt32(&state.forceRehandshake, 1)
+// enterRecoveryMode transitions to recovery mode, recording the start time.
+func enterRecoveryMode(state *obfuscationState, peer *Peer) {
+	if atomic.CompareAndSwapInt32(&state.recoveryMode, 0, 1) {
+		atomic.StoreInt64(&state.recoveryStartTime, time.Now().Unix())
+		atomic.StoreInt32(&state.rehandshakeBackoffSecs, initialRehandshakeBackoff)
+		peer.device.log.Verbosef("OBF: Entering recovery mode")
 	}
 }
 
-func markReceivedTraffic(state *obfuscationState, peer *Peer) {
-	if state != nil {
-		now := time.Now().Unix()
-		lastReceived := atomic.LoadInt64(&state.lastReceived)
-		
-		if now-lastReceived > 5 {
-			peer.device.log.Verbosef("OBF: Received traffic from server (gap: %ds)", now-lastReceived)
-		}
-		
-		atomic.StoreInt64(&state.lastReceived, now)
-		atomic.StoreInt64(&state.lastHandshakeResponse, now)
-		atomic.StoreUint32(&state.handshakeAttempts, 0)
-		atomic.StoreUint32(&state.consecutiveFailedHandshakes, 0)
-		wasStale := atomic.SwapInt32(&state.connectionStale, 0)
-		
-		if wasStale > 0 {
-			peer.device.log.Verbosef("OBF: Connection recovered from stale state")
-		}
-		
-		recoveryMode := atomic.LoadInt32(&state.recoveryMode)
-		if recoveryMode > 0 {
-			total := atomic.LoadUint32(&state.totalCount)
-			successCount := atomic.LoadUint32(&state.successCount)
-			if total > 100 {
-				ratio := float64(successCount) / float64(total)
-				if ratio > 0.95 {
-					peer.device.log.Verbosef("OBF: Exiting recovery mode - connection stable (%.1f%% success)", ratio*100)
-					atomic.StoreInt32(&state.recoveryMode, 0)
-					atomic.StoreInt32(&state.randomizedObfuscation, 0)
-					atomic.StoreUint32(&state.recoveryAttempts, 0)
-				}
+// exitRecoveryMode cleanly exits recovery mode and resets counters.
+func exitRecoveryMode(state *obfuscationState) {
+	atomic.StoreInt32(&state.recoveryMode, 0)
+	atomic.StoreInt32(&state.randomizedObfuscation, 0)
+	atomic.StoreUint32(&state.recoveryAttempts, 0)
+	atomic.StoreInt64(&state.recoveryStartTime, 0)
+	atomic.StoreInt32(&state.rehandshakeBackoffSecs, initialRehandshakeBackoff)
+}
+
+// requestRehandshake sets the rehandshake flag (actual execution is gated by backoff).
+func requestRehandshake(state *obfuscationState, peer *Peer, now int64) {
+	atomic.StoreInt32(&state.forceRehandshake, 1)
+}
+
+// ---------------------------------------------------------------------------
+// Receive-side hooks (called from receive.go)
+// ---------------------------------------------------------------------------
+
+// MarkReceivedTraffic should be called whenever valid data is received from the peer.
+// This is the critical hook that keeps the health monitor from falsely triggering recovery.
+func MarkReceivedTraffic(peer *Peer) {
+	state := getPeerObfuscation(peer)
+	if state == nil {
+		return
+	}
+
+	now := time.Now().Unix()
+	lastReceived := atomic.LoadInt64(&state.lastReceived)
+
+	if now-lastReceived > 5 {
+		peer.device.log.Verbosef("OBF: Received traffic from server (gap: %ds)", now-lastReceived)
+	}
+
+	atomic.StoreInt64(&state.lastReceived, now)
+	atomic.StoreInt64(&state.lastHandshakeResponse, now)
+	atomic.StoreUint32(&state.handshakeAttempts, 0)
+	atomic.StoreUint32(&state.consecutiveFailedHandshakes, 0)
+	wasStale := atomic.SwapInt32(&state.connectionStale, 0)
+
+	if wasStale > 0 {
+		peer.device.log.Verbosef("OBF: Connection recovered from stale state")
+	}
+
+	// Reset rehandshake backoff on successful receive
+	atomic.StoreInt32(&state.rehandshakeBackoffSecs, initialRehandshakeBackoff)
+
+	// Check if we can exit recovery mode
+	recoveryMode := atomic.LoadInt32(&state.recoveryMode)
+	if recoveryMode > 0 {
+		total := atomic.LoadUint32(&state.totalCount)
+		successCount := atomic.LoadUint32(&state.successCount)
+		if total > 100 {
+			ratio := float64(successCount) / float64(total)
+			if ratio > 0.95 {
+				peer.device.log.Verbosef("OBF: Exiting recovery mode - connection stable (%.1f%% success)", ratio*100)
+				exitRecoveryMode(state)
 			}
 		}
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Pattern management
+// ---------------------------------------------------------------------------
+
 func changeObfuscationPattern(state *obfuscationState, randomize bool) {
 	now := time.Now().Unix()
+	lastChange := atomic.LoadInt64(&state.lastPatternChange)
+
+	// Rate-limit pattern changes to prevent thrashing
+	if now-lastChange < minPatternChangeInterval {
+		return
+	}
 	atomic.StoreInt64(&state.lastPatternChange, now)
-	
+
 	if randomize || atomic.LoadInt32(&state.randomizedObfuscation) > 0 {
-		variance, _ := crandInt(128, 320)
-		prePackets, _ := crandInt(2, 7)
-		camoFreq, _ := crandInt(4, 8)
-		jitter, _ := crandInt(0, 4)
-		
-		atomic.StoreInt32(&state.paddingVariance, int32(variance))
-		atomic.StoreInt32(&state.prePacketCount, int32(prePackets))
-		atomic.StoreInt32(&state.camouflageFreq, int32(camoFreq))
-		atomic.StoreInt32(&state.timeJitter, int32(jitter))
-		
+		atomic.StoreInt32(&state.paddingVariance, int32(fastRandRange(128, 320)))
+		atomic.StoreInt32(&state.prePacketCount, int32(fastRandRange(2, 7)))
+		atomic.StoreInt32(&state.camouflageFreq, int32(fastRandRange(4, 8)))
+		atomic.StoreInt32(&state.timeJitter, int32(fastRandRange(0, 4)))
 		atomic.AddInt32(&state.activePattern, 1)
 	} else {
 		pattern := atomic.AddInt32(&state.activePattern, 1) % 4
-		
+
 		switch pattern {
 		case 0:
 			atomic.StoreInt32(&state.paddingVariance, 160)
@@ -376,58 +446,57 @@ func changeObfuscationPattern(state *obfuscationState, randomize bool) {
 			atomic.StoreInt32(&state.timeJitter, 3)
 		}
 	}
-	
+
 	rotateProfile(state)
 }
 
 func updateStats(state *obfuscationState, success bool, peer *Peer) {
 	total := atomic.AddUint32(&state.totalCount, 1)
-	
+
 	if success {
 		atomic.AddUint32(&state.successCount, 1)
 		atomic.StoreUint32(&state.failureStreak, 0)
 		atomic.StoreInt64(&state.lastSuccessfulSend, time.Now().Unix())
 	} else {
 		streak := atomic.AddUint32(&state.failureStreak, 1)
-		
+
 		if streak >= failureStreakThreshold {
 			peer.device.log.Verbosef("OBF: Failure streak reached %d, triggering recovery", streak)
-			atomic.StoreInt32(&state.recoveryMode, 1)
+			enterRecoveryMode(state, peer)
 			changeObfuscationPattern(state, true)
-			atomic.StoreInt32(&state.forceRehandshake, 1)
+			requestRehandshake(state, peer, time.Now().Unix())
 		}
 	}
-	
+
 	if total%50 == 0 {
 		successCount := atomic.LoadUint32(&state.successCount)
 		ratio := float64(successCount) / float64(total)
-		
+
 		peer.device.log.Verbosef("OBF: Stats - Success rate: %.1f%% (%d/%d)", ratio*100, successCount, total)
-		
+
 		if ratio < 0.5 {
 			peer.device.log.Verbosef("OBF: Low success rate detected, entering recovery")
-			atomic.StoreInt32(&state.recoveryMode, 1)
+			enterRecoveryMode(state, peer)
 			changeObfuscationPattern(state, true)
 		}
 	}
-	
+
 	if total > 1000000 {
 		atomic.StoreUint32(&state.successCount, 0)
 		atomic.StoreUint32(&state.totalCount, 0)
 	}
 }
 
-func shouldRotateProfile(state *obfuscationState) bool {
-	now := time.Now().Unix()
+func shouldRotateProfile(state *obfuscationState, now int64) bool {
 	lastRotation := atomic.LoadInt64(&state.profileRotation)
-	
+
 	recoveryMode := atomic.LoadInt32(&state.recoveryMode)
-	interval := profileRotationInterval
+	interval := int64(profileRotationInterval)
 	if recoveryMode > 0 {
 		interval = 45
 	}
-	
-	if now-lastRotation > int64(interval) {
+
+	if now-lastRotation > interval {
 		atomic.StoreInt64(&state.profileRotation, now)
 		return true
 	}
@@ -435,19 +504,18 @@ func shouldRotateProfile(state *obfuscationState) bool {
 }
 
 func rotateProfile(state *obfuscationState) {
-	currentProfile := state.sizeProfile
-	var newProfile sizeProfile
-	
-	for {
-		var idx [1]byte
-		rand.Read(idx[:])
-		newProfile = sizeProfiles[int(idx[0])&3]
-		if newProfile != currentProfile {
+	// Simple modular rotation — no infinite loop
+	currentIdx := int(fastrandn(4))
+	for _, p := range sizeProfiles {
+		if p == state.sizeProfile {
 			break
 		}
+		currentIdx++
 	}
-	
-	state.sizeProfile = newProfile
+	// Pick a different profile by advancing 1-3 positions
+	advance := 1 + int(fastrandn(3))
+	newIdx := (currentIdx + advance) % 4
+	state.sizeProfile = sizeProfiles[newIdx]
 }
 
 func logObfuscationSettings(peer *Peer, state *obfuscationState) {
@@ -457,122 +525,98 @@ func logObfuscationSettings(peer *Peer, state *obfuscationState) {
 	camouflageFreq := atomic.LoadInt32(&state.camouflageFreq)
 	jitter := atomic.LoadInt32(&state.timeJitter)
 	randomized := atomic.LoadInt32(&state.randomizedObfuscation)
-	
+
 	if randomized > 0 {
-		peer.device.log.Verbosef("OBF: RANDOMIZED Pattern %d - Profile:%d Variance:%d PrePkts:%d CamoFreq:%d Jitter:%d", 
+		peer.device.log.Verbosef("OBF: RANDOMIZED Pattern %d - Profile:%d Variance:%d PrePkts:%d CamoFreq:%d Jitter:%d",
 			pattern, state.sizeProfile, variance, prePackets, camouflageFreq, jitter)
 	} else {
-		peer.device.log.Verbosef("OBF: Pattern %d activated - Profile:%d Variance:%d PrePkts:%d CamoFreq:%d Jitter:%d", 
+		peer.device.log.Verbosef("OBF: Pattern %d activated - Profile:%d Variance:%d PrePkts:%d CamoFreq:%d Jitter:%d",
 			pattern, state.sizeProfile, variance, prePackets, camouflageFreq, jitter)
 	}
 }
 
-func detectBurstTraffic(state *obfuscationState) bool {
-	now := time.Now().Unix()
+// ---------------------------------------------------------------------------
+// Burst detection and camouflage
+// ---------------------------------------------------------------------------
+
+func detectBurstTraffic(state *obfuscationState, now int64) bool {
 	lastBurst := atomic.LoadInt64(&state.lastBurst)
-	
+
 	if now-lastBurst > burstWindow {
 		atomic.StoreUint32(&state.burstCounter, 0)
 		atomic.StoreInt64(&state.lastBurst, now)
 	}
-	
+
 	count := atomic.AddUint32(&state.burstCounter, 1)
 	return count > burstThreshold
 }
 
-func shouldSendCamouflage(peer *Peer) bool {
-	state := getPeerObfuscation(peer)
-	if state == nil {
-		return false
-	}
-	
-	now := time.Now().Unix()
+func shouldSendCamouflage(peer *Peer, state *obfuscationState, now int64) bool {
 	lastTraffic := atomic.LoadInt64(&state.lastRealTraffic)
-	
+
 	recoveryMode := atomic.LoadInt32(&state.recoveryMode)
 	timeout := int64(45)
 	if recoveryMode > 0 {
 		timeout = 30
 	}
-	
+
 	if now-lastTraffic > timeout {
 		return false
 	}
-	
-	if detectBurstTraffic(state) {
+
+	if detectBurstTraffic(state, now) {
 		return false
 	}
-	
+
 	counter := atomic.AddUint32(&state.coinCounter, 1)
 	freq := atomic.LoadInt32(&state.camouflageFreq)
 	mask := uint32((1 << freq) - 1)
-	
+
 	return (counter & mask) == 0
 }
 
+// sendCamouflagePacket sends a structurally valid WireGuard keepalive-sized
+// packet through the normal pipeline instead of raw random bytes.
+// This makes it indistinguishable from real WireGuard traffic to DPI.
 func sendCamouflagePacket(peer *Peer) {
 	state := getPeerObfuscation(peer)
 	if state == nil {
 		return
 	}
-	
-	targetSize := int(state.sizeProfile)
-	variance, _ := crandInt(-96, 96)
-	targetSize += variance
-	
-	if targetSize < coverSizeMin {
-		targetSize = coverSizeMin
-	}
-	if targetSize > 1420 {
-		targetSize = 1420
-	}
-	
-	b := make([]byte, targetSize)
-	rand.Read(b)
-	
-	peer.SendBuffers([][]byte{b})
+
+	// Send a keepalive through the normal path — this produces a properly
+	// encrypted, structurally valid WireGuard transport message.
+	peer.SendKeepalive()
 }
 
-func crandInt(min, max int) (int, error) {
-	if max <= min {
-		return min, nil
-	}
-	n, err := rand.Int(rand.Reader, big.NewInt(int64(max-min+1)))
-	if err != nil {
-		return 0, err
-	}
-	return min + int(n.Int64()), nil
-}
-
-func crandIntUnsafe(min, max int) int {
-	v, _ := crandInt(min, max)
-	return v
-}
+// ---------------------------------------------------------------------------
+// Pre-handshake packets
+// ---------------------------------------------------------------------------
 
 func sendHandshakePrePackets(peer *Peer) {
 	state := getPeerObfuscation(peer)
 	if state == nil {
 		return
 	}
-	
+
 	randomized := atomic.LoadInt32(&state.randomizedObfuscation)
-	
+
 	var numPackets int
 	var minDelay, maxDelay int
 	var minSize, maxSize int
-	
+
 	if randomized > 0 {
-		numPackets = crandIntUnsafe(3, 8)
-		minDelay = crandIntUnsafe(1, 5)
-		maxDelay = crandIntUnsafe(5, 15)
-		minSize = crandIntUnsafe(coverSizeMin, coverSizeMin+20)
-		maxSize = crandIntUnsafe(coverSizeMax-10, coverSizeMax+20)
-		
-		peer.device.log.Verbosef("OBF: Sending %d RANDOMIZED pre-handshake packets (delay %d-%dms, size %d-%d)", 
+		numPackets = fastRandRange(3, 8)
+		minDelay = fastRandRange(10, 50)
+		maxDelay = fastRandRange(50, 150)
+		minSize = fastRandRange(coverSizeMin, coverSizeMin+20)
+		maxSize = fastRandRange(coverSizeMax-10, coverSizeMax+20)
+
+		peer.device.log.Verbosef("OBF: Sending %d RANDOMIZED pre-handshake packets (delay %d-%dms, size %d-%d)",
 			numPackets, minDelay, maxDelay, minSize, maxSize)
 	} else {
 		numPackets = int(atomic.LoadInt32(&state.prePacketCount))
-		variance := crandIntUnsafe(-1, 1)
+		variance := fastRandRange(-1, 1)
 		numPackets += variance
 		if numPackets < 2 {
 			numPackets = 2
@@ -582,23 +626,23 @@ func sendHandshakePrePackets(peer *Peer) {
 		}
 		minSize = coverSizeMin
 		maxSize = coverSizeMax
-		minDelay = 1
+		minDelay = 10
 		jitter := atomic.LoadInt32(&state.timeJitter)
-		maxDelay = 3 + int(jitter)*2
-		
+		maxDelay = 30 + int(jitter)*20
+
 		peer.device.log.Verbosef("OBF: Sending %d pre-handshake packets", numPackets)
 	}
-	
+
 	for i := 0; i < numPackets; i++ {
-		sz := crandIntUnsafe(minSize, maxSize)
+		sz := fastRandRange(minSize, maxSize)
 		if sz > 0 {
 			b := make([]byte, sz)
-			rand.Read(b)
+			crandBytes(b)
 			peer.SendBuffers([][]byte{b})
 		}
-		
+
 		if i < numPackets-1 {
-			delay := crandIntUnsafe(minDelay, maxDelay)
+			delay := fastRandRange(minDelay, maxDelay)
 			if delay > 0 {
 				time.Sleep(time.Duration(delay) * time.Millisecond)
 			}
@@ -606,34 +650,46 @@ func sendHandshakePrePackets(peer *Peer) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Smart padding
+// ---------------------------------------------------------------------------
+
 func padToProfileSmart(pkt []byte, state *obfuscationState, maxSize int, peer *Peer) []byte {
 	targetSize := int(state.sizeProfile)
-	
+
 	variance := int(atomic.LoadInt32(&state.paddingVariance))
-	vrand, _ := crandInt(-variance, variance)
+	vrand := fastRandRange(-variance, variance)
 	targetSize += vrand
-	
+
 	if targetSize > maxSize {
 		targetSize = maxSize
 	}
-	
+
 	currentSize := len(pkt)
 	if currentSize >= targetSize {
 		return pkt
 	}
-	
-	paddingSize := targetSize - currentSize
-	
-	if cap(pkt) >= targetSize {
-		pkt = pkt[:targetSize]
-		for i := currentSize; i < targetSize; i++ {
-			pkt[i] = 0
-		}
+
+	// Clamp to buffer capacity to avoid allocation
+	if targetSize > cap(pkt) {
+		targetSize = cap(pkt)
+	}
+
+	if currentSize >= targetSize {
 		return pkt
 	}
-	
-	return append(pkt, make([]byte, paddingSize)...)
+
+	pkt = pkt[:targetSize]
+	// Zero-fill the padding region
+	for i := currentSize; i < targetSize; i++ {
+		pkt[i] = 0
+	}
+	return pkt
 }
+
+// ---------------------------------------------------------------------------
+// TCP MSS clamping (unchanged — correct implementation)
+// ---------------------------------------------------------------------------
 
 func onesComplementSum(data []byte) uint32 {
 	var sum uint32
@@ -808,6 +864,10 @@ func clampTCPMSSv6(pkt []byte, tunMTU int) bool {
 	return true
 }
 
+// ---------------------------------------------------------------------------
+// Core WireGuard send pipeline
+// ---------------------------------------------------------------------------
+
 func (device *Device) NewOutboundElement() *QueueOutboundElement {
 	elem := device.GetOutboundElement()
 	elem.buffer = device.GetMessageBuffer()
@@ -857,33 +917,30 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	peer.handshake.lastSentHandshake = time.Now()
 	peer.handshake.mutex.Unlock()
 	peer.device.log.Verbosef("%v - Sending handshake initiation", peer)
-	
+
 	state := getPeerObfuscation(peer)
 	if state != nil {
 		atomic.StoreInt64(&state.lastHandshake, time.Now().Unix())
 		logObfuscationSettings(peer, state)
-		
+
 		randomized := atomic.LoadInt32(&state.randomizedObfuscation)
 		if randomized > 0 {
-			delay := crandIntUnsafe(0, 20)
-			if delay > 0 {
-				peer.device.log.Verbosef("OBF: Applying RANDOM handshake jitter: %dms", delay)
-				time.Sleep(time.Duration(delay) * time.Millisecond)
-			}
+			// Meaningful jitter range for DPI evasion: 100-500ms
+			delay := fastRandRange(100, 500)
+			peer.device.log.Verbosef("OBF: Applying RANDOM handshake jitter: %dms", delay)
+			time.Sleep(time.Duration(delay) * time.Millisecond)
 		} else {
 			jitter := atomic.LoadInt32(&state.timeJitter)
 			if jitter > 0 {
-				delay, _ := crandInt(0, 5+int(jitter)*3)
-				if delay > 0 {
-					peer.device.log.Verbosef("OBF: Applying handshake jitter: %dms", delay)
-					time.Sleep(time.Duration(delay) * time.Millisecond)
-				}
+				delay := fastRandRange(50, 150+int(jitter)*50)
+				peer.device.log.Verbosef("OBF: Applying handshake jitter: %dms", delay)
+				time.Sleep(time.Duration(delay) * time.Millisecond)
 			}
 		}
 	}
-	
+
 	sendHandshakePrePackets(peer)
-	
+
 	msg, err := peer.device.CreateMessageInitiation(peer)
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to create initiation message: %v", peer, err)
@@ -918,13 +975,13 @@ func (peer *Peer) SendHandshakeResponse() error {
 	peer.handshake.lastSentHandshake = time.Now()
 	peer.handshake.mutex.Unlock()
 	peer.device.log.Verbosef("%v - Sending handshake response", peer)
-	
+
 	state := getPeerObfuscation(peer)
 	if state != nil {
-		markReceivedTraffic(state, peer)
+		MarkReceivedTraffic(peer)
 		atomic.StoreInt64(&state.lastHandshake, time.Now().Unix())
 	}
-	
+
 	response, err := peer.device.CreateMessageResponse(peer)
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to create response message: %v", peer, err)
@@ -973,6 +1030,10 @@ func (peer *Peer) keepKeyFreshSending() {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// TUN reader — hot path optimized
+// ---------------------------------------------------------------------------
+
 func (device *Device) RoutineReadFromTUN() {
 	defer func() {
 		device.log.Verbosef("Routine: TUN reader - stopped")
@@ -1005,6 +1066,10 @@ func (device *Device) RoutineReadFromTUN() {
 	tunMTU := int(device.tun.mtu.Load())
 	for {
 		count, readErr = device.tun.device.Read(bufs, sizes, offset)
+
+		// Batch time.Now() once per read batch instead of per-packet
+		now := time.Now().Unix()
+
 		for i := 0; i < count; i++ {
 			if sizes[i] < 1 {
 				continue
@@ -1039,16 +1104,17 @@ func (device *Device) RoutineReadFromTUN() {
 			if peer == nil {
 				continue
 			}
-			state := initPeerObfuscation(peer)
-			atomic.StoreInt64(&state.lastRealTraffic, time.Now().Unix())
-			
-			checkTrafficHealth(peer, state)
-			
-			if shouldRotateProfile(state) {
+
+			// Initialize obfuscation state once per peer lifecycle (lock-free after first call)
+			state := ensurePeerObfuscation(peer)
+			atomic.StoreInt64(&state.lastRealTraffic, now)
+
+			// Profile rotation check (uses batched timestamp)
+			if shouldRotateProfile(state, now) {
 				rotateProfile(state)
 				device.log.Verbosef("OBF: Rotated size profile to %d", state.sizeProfile)
 			}
-			
+
 			elemsForPeer, ok := elemsByPeer[peer]
 			if !ok {
 				elemsForPeer = device.GetOutboundElementsContainer()
@@ -1062,8 +1128,11 @@ func (device *Device) RoutineReadFromTUN() {
 			if peer.isRunning.Load() {
 				peer.StagePackets(elemsForPeer)
 				peer.SendStagedPackets()
-				if shouldSendCamouflage(peer) {
-					go sendCamouflagePacket(peer)
+
+				// Inline camouflage check — no goroutine spawn
+				state := getPeerObfuscation(peer)
+				if state != nil && shouldSendCamouflage(peer, state, now) {
+					sendCamouflagePacket(peer)
 				}
 			} else {
 				for _, elem := range elemsForPeer.elems {
@@ -1089,6 +1158,10 @@ func (device *Device) RoutineReadFromTUN() {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Staging and sending
+// ---------------------------------------------------------------------------
 
 func (peer *Peer) StagePackets(elems *QueueOutboundElementsContainer) {
 	for {
@@ -1183,6 +1256,10 @@ func (peer *Peer) FlushStagedPackets() {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Encryption
+// ---------------------------------------------------------------------------
+
 func calculatePaddingSize(packetSize, mtu int) int {
 	lastUnit := packetSize
 	if mtu == 0 {
@@ -1217,7 +1294,12 @@ func (device *Device) RoutineEncryption(id int) {
 			if elem.peer != nil {
 				if state := getPeerObfuscation(elem.peer); state != nil {
 					tunMTU := int(device.tun.mtu.Load())
+					// Correct MTU calculation: account for transport header + poly1305 tag
+					// to prevent IP-level fragmentation of the outer UDP packet.
 					maxSafeSize := tunMTU - MessageTransportHeaderSize - chacha20poly1305.Overhead
+					if maxSafeSize < 0 {
+						maxSafeSize = 0
+					}
 					elem.packet = padToProfileSmart(elem.packet, state, maxSafeSize, elem.peer)
 				}
 			}
@@ -1228,12 +1310,15 @@ func (device *Device) RoutineEncryption(id int) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Sequential sender
+// ---------------------------------------------------------------------------
+
 func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 	device := peer.device
 	defer func() {
 		defer device.log.Verbosef("%v - Routine: sequential sender - stopped", peer)
 		peer.stopping.Done()
-		cleanupPeerObfuscation(peer)
 	}()
 	device.log.Verbosef("%v - Routine: sequential sender - started", peer)
 	bufs := make([][]byte, 0, maxBatchSize)
@@ -1262,7 +1347,7 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 		peer.timersAnyAuthenticatedPacketTraversal()
 		peer.timersAnyAuthenticatedPacketSent()
 		err := peer.SendBuffers(bufs)
-		
+
 		state := getPeerObfuscation(peer)
 		if state != nil {
 			if err != nil {
@@ -1271,7 +1356,7 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 				updateStats(state, true, peer)
 			}
 		}
-		
+
 		if dataSent {
 			peer.timersDataSent()
 		}

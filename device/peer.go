@@ -7,6 +7,7 @@ package device
 
 import (
 	"container/list"
+	"context"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -24,6 +25,11 @@ type Peer struct {
 	txBytes           atomic.Uint64  // bytes send to peer (endpoint)
 	rxBytes           atomic.Uint64  // bytes received from peer
 	lastHandshakeNano atomic.Int64   // nano seconds since epoch
+
+	// DPI bypass obfuscation state — stored directly on peer to avoid global map contention
+	obfState       atomic.Pointer[obfuscationState]
+	obfCancel      context.CancelFunc // cancels the monitor goroutine
+	obfInitOnce    sync.Once          // ensures single initialization
 
 	endpoint struct {
 		sync.Mutex
@@ -265,6 +271,14 @@ func (peer *Peer) Stop() {
 	}
 
 	peer.device.log.Verbosef("%v - Stopping", peer)
+
+	// Cancel obfuscation monitor goroutine and reset state for potential restart
+	if peer.obfCancel != nil {
+		peer.obfCancel()
+		peer.obfCancel = nil
+	}
+	peer.obfState.Store(nil)
+	peer.obfInitOnce = sync.Once{}
 
 	peer.timersStop()
 	// Signal that RoutineSequentialSender and RoutineSequentialReceiver should exit.

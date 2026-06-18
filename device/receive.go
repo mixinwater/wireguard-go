@@ -403,6 +403,9 @@ func (device *Device) RoutineHandshake(id int) {
 			device.log.Verbosef("%v - Received handshake response", peer)
 			peer.rxBytes.Add(uint64(len(elem.packet)))
 
+			// Mark received traffic for obfuscation health monitor
+			MarkReceivedTraffic(peer)
+
 			// update timers
 
 			peer.timersAnyAuthenticatedPacketTraversal()
@@ -516,6 +519,10 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			peer.keepKeyFreshReceiving()
 			peer.timersAnyAuthenticatedPacketTraversal()
 			peer.timersAnyAuthenticatedPacketReceived()
+
+			// Critical: notify obfuscation health monitor that we received valid traffic.
+			// Without this, the monitor falsely detects stale connections.
+			MarkReceivedTraffic(peer)
 		}
 		if dataPacketReceived {
 			peer.timersDataReceived()
